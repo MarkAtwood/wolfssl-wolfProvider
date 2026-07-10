@@ -84,7 +84,8 @@ CLEANFILES += $(SBOM_CDX) $(SBOM_SPDX) $(SBOM_SPDX_TV)
 
 # Stage a `make install` into a private tree, discover the installed artifact
 # (shared/static library or program; ELF/Mach-O/PE), hash it, capture the
-# configured build macros (AM_CPPFLAGS + config.h), generate SPDX+CDX, validate
+# configured build macros (AM_CPPFLAGS/CPPFLAGS, AM_CFLAGS/CFLAGS + config.h),
+# generate SPDX+CDX, validate
 # the SPDX, then convert to tag-value.  The staging tree and temp defines file
 # are removed unconditionally via `trap`, even on failure.  SOURCE_DATE_EPOCH is
 # honoured for reproducible output (defaults to the last git commit time).
@@ -127,6 +128,7 @@ sbom:
 	fi; \
 	echo "SBOM: hashing $$sbom_art"; \
 	$(CC) -dM -E $(DEFAULT_INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) \
+	    $(AM_CFLAGS) $(CFLAGS) \
 	    $(if $(wildcard $(abs_builddir)/config.h),-include $(abs_builddir)/config.h) \
 	    -x c /dev/null > "$$_defines"; \
 	if test -z "$${SOURCE_DATE_EPOCH:-}" && test -n "$(GIT)" && \
