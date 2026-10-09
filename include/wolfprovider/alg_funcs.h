@@ -167,7 +167,7 @@ typedef void (*DFUNC)(void);
 #define WP_NAMES_ED448          "ED448"
 
 /* DH names. */
-#define WP_NAMES_DH             "DH"
+#define WP_NAMES_DH             "DH:dhKeyAgreement:1.2.840.113549.1.3.1"
 #define WP_NAMES_DHX            "DHX"
 
 /* ML-KEM names (NIST FIPS 203). */
@@ -192,6 +192,9 @@ typedef void (*DFUNC)(void);
 
 /* Decoder names. */
 #define WP_NAMES_DER            "DER"
+/* Private name: only the file store fetches these, so no other decoder chain
+ * picks them up. */
+#define WP_NAMES_DER2OBJ        "wolfprov-der2obj"
 
 /* Store names. */
 #define WP_NAMES_FILE           "file"
@@ -485,6 +488,8 @@ extern const OSSL_DISPATCH wp_mldsa87_spki_decoder_functions[];
 extern const OSSL_DISPATCH wp_mldsa87_pki_decoder_functions[];
 extern const OSSL_DISPATCH wp_pem_to_der_decoder_functions[];
 extern const OSSL_DISPATCH wp_epki_to_pki_decoder_functions[];
+extern const OSSL_DISPATCH wp_der_to_cert_decoder_functions[];
+extern const OSSL_DISPATCH wp_der_to_crl_decoder_functions[];
 /* Encode implementations. */
 extern const OSSL_DISPATCH wp_rsa_spki_der_encoder_functions[];
 extern const OSSL_DISPATCH wp_rsa_spki_pem_encoder_functions[];

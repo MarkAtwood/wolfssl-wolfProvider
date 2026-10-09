@@ -370,18 +370,21 @@ static int wp_ed25519_digest_sign(wp_EcxSigCtx *ctx, unsigned char *sig,
     else if (sig == NULL) {
         *sigLen = ED25519_SIG_SIZE;
     }
-    else if (*sigLen != ED25519_SIG_SIZE) {
-        ok = 0;
-    }
     else {
-        int rc;
-        word32 len;
-        ed25519_key* ed25519 = (ed25519_key*)wp_ecx_get_key(ctx->ecx);
-
+        /* The buffer size is sigSize, or *sigLen when sigSize is -1. Any
+         * buffer of at least ED25519_SIG_SIZE bytes is accepted, as OpenSSL's
+         * default provider does; the signature is always ED25519_SIG_SIZE. */
         if (sigSize == (size_t)-1) {
             sigSize = *sigLen;
         }
-        len = (word32)sigSize;
+        if (sigSize < ED25519_SIG_SIZE) {
+            ok = 0;
+        }
+    }
+    if (ok && (sig != NULL)) {
+        int rc;
+        word32 len = ED25519_SIG_SIZE;
+        ed25519_key* ed25519 = (ed25519_key*)wp_ecx_get_key(ctx->ecx);
 
         if (!ed25519->pubKeySet) {
             unsigned char pubKey[ED25519_PUB_KEY_SIZE];

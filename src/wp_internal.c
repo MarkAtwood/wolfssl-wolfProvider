@@ -993,6 +993,81 @@ int wp_cipher_from_params(const OSSL_PARAM params[], int* cipher,
 /* Maximum passphrase length read from the password callback. */
 #define WP_EPKI_PASSWORD_MAX    1024
 
+#ifdef WP_HAVE_PKCS8_ENC
+/* Whether the linked wc_EncryptPKCS8Key_ex() leaves out the PKCS #5 padding
+ * block for block-aligned keys: 1 yes, 0 no, -1 not probed yet. wolfSSL
+ * computed the padding as (blockSz - (keySz & (blockSz - 1))) & (blockSz - 1),
+ * which is 0 for aligned input, until b1d558c8d (after 5.9.1; the 5.9.1 FIPS
+ * module has the old code). PKCS #5 needs a full block there, and OpenSSL
+ * rejects the key without it ("bad decrypt"). Probed rather than taken from
+ * the version so FIPS modules and backports are judged by behavior. Racing
+ * first probes store the same value. */
+static int wp_epki_pad_missing = -1;
+
+/**
+ * Probe whether wc_EncryptPKCS8Key_ex() omits the padding block for aligned
+ * input, once. Length-only encodings of a 16- and a 17-byte key both take two
+ * AES blocks with correct padding; without the padding block the aligned one
+ * takes one. Call with the provider RNG locked.
+ *
+ * @param [in]  cipher  wolfCrypt cipher identifier (AES-CBC).
+ * @param [in]  rng     Provider random number generator.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+static int wp_epki_probe_pad(int cipher, WC_RNG* rng)
+{
+    int ok = 1;
+    int i;
+    int rc;
+    word32 sz[2] = { 0, 0 };
+    byte key[AES_BLOCK_SIZE + 1];
+    byte salt[WP_EPKI_SALT_LEN];
+
+    if (wp_epki_pad_missing < 0) {
+        XMEMSET(key, 0, sizeof(key));
+        XMEMSET(salt, 0, sizeof(salt));
+        for (i = 0; ok && (i < 2); i++) {
+        #if LIBWOLFSSL_VERSION_HEX >= 0x05008002
+            rc = wc_EncryptPKCS8Key_ex(key, (word32)(AES_BLOCK_SIZE + i), NULL,
+                &sz[i], "", 0, WP_PKCS5, WP_PBES2, cipher, salt, sizeof(salt),
+                WP_PKCS12_ITERATIONS_DEFAULT, HMAC_SHA256_OID, rng, NULL);
+        #else
+            rc = wc_EncryptPKCS8Key(key, (word32)(AES_BLOCK_SIZE + i), NULL,
+                &sz[i], "", 0, WP_PKCS5, WP_PBES2, cipher, salt, sizeof(salt),
+                WP_PKCS12_ITERATIONS_DEFAULT, rng, NULL);
+        #endif
+            if (rc != LENGTH_ONLY_E) {
+                ok = 0;
+            }
+        }
+        if (ok) {
+            wp_epki_pad_missing = (sz[0] < sz[1]) ? 1 : 0;
+        }
+    }
+
+    return ok;
+}
+
+/**
+ * Length to hand wc_EncryptPKCS8Key_ex() for a plaintext key: with an extra
+ * padding block when the linked wolfSSL omits it for aligned input (the
+ * caller appends that block, so wolfSSL sees aligned input and adds nothing).
+ *
+ * @param [in]  len  Plaintext key length in bytes.
+ * @return  Length to encrypt.
+ */
+static word32 wp_epki_enc_len(word32 len)
+{
+    word32 encLen = len;
+
+    if ((wp_epki_pad_missing == 1) && ((len % AES_BLOCK_SIZE) == 0)) {
+        encLen += AES_BLOCK_SIZE;
+    }
+    return encLen;
+}
+#endif
+
 /**
  * Get the size of the PBES2 EncryptedPrivateKeyInfo encoding of a PKCS #8 key.
  *
@@ -1037,16 +1112,21 @@ int wp_encrypt_key_pkcs8_size(WOLFPROV_CTX* provCtx, int cipher,
     }
 #endif
     if (ok) {
+        ok = wp_epki_probe_pad(cipher, wp_provctx_get_rng(provCtx));
+    }
+    if (ok) {
         /* Passing a NULL output buffer returns the required length. The _ex
          * form (wolfSSL 5.8.2+) selects the HMAC-SHA256 PBKDF2 PRF; older
          * wolfSSL uses the SHA-1 PRF. */
     #if LIBWOLFSSL_VERSION_HEX >= 0x05008002
-        rc = wc_EncryptPKCS8Key_ex(fakeData, plainLen, NULL, &outSz, "", 0,
+        rc = wc_EncryptPKCS8Key_ex(fakeData, wp_epki_enc_len(plainLen), NULL,
+            &outSz, "", 0,
             WP_PKCS5, WP_PBES2, cipher, fakeSalt, sizeof(fakeSalt),
             WP_PKCS12_ITERATIONS_DEFAULT, HMAC_SHA256_OID,
             wp_provctx_get_rng(provCtx), NULL);
     #else
-        rc = wc_EncryptPKCS8Key(fakeData, plainLen, NULL, &outSz, "", 0,
+        rc = wc_EncryptPKCS8Key(fakeData, wp_epki_enc_len(plainLen), NULL,
+            &outSz, "", 0,
             WP_PKCS5, WP_PBES2, cipher, fakeSalt, sizeof(fakeSalt),
             WP_PKCS12_ITERATIONS_DEFAULT, wp_provctx_get_rng(provCtx), NULL);
     #endif
@@ -1117,6 +1197,8 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
 #endif
     size_t passwordSz = WP_EPKI_PASSWORD_MAX;
     WC_RNG* rng = NULL;
+    byte* padded = NULL;
+    word32 encLen = plainLen;
 
     WOLFPROV_ENTER(WP_LOG_COMP_PROVIDER, "wp_encrypt_key_pkcs8");
 
@@ -1156,6 +1238,23 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
     }
 #endif
     if (ok) {
+        ok = wp_epki_probe_pad(cipher, rng);
+    }
+    if (ok) {
+        encLen = wp_epki_enc_len(plainLen);
+    }
+    /* Aligned key and a wolfSSL that omits the padding block: append it. */
+    if (ok && (encLen != plainLen)) {
+        padded = (byte*)OPENSSL_malloc(encLen);
+        if (padded == NULL) {
+            ok = 0;
+        }
+        else {
+            XMEMCPY(padded, plain, plainLen);
+            XMEMSET(padded + plainLen, AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+        }
+    }
+    if (ok) {
         /* Generate the PBKDF2 salt. */
         rc = wc_RNG_GenerateBlock(rng, salt, sizeof(salt));
         if (rc == 0) {
@@ -1163,12 +1262,14 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
              * (wolfSSL 5.8.2+) selects the HMAC-SHA256 PBKDF2 PRF; older
              * wolfSSL uses the SHA-1 PRF. */
         #if LIBWOLFSSL_VERSION_HEX >= 0x05008002
-            rc = wc_EncryptPKCS8Key_ex((byte*)plain, plainLen, out, &outSz,
+            rc = wc_EncryptPKCS8Key_ex((padded != NULL) ? padded : (byte*)plain,
+                encLen, out, &outSz,
                 password, (int)passwordSz, WP_PKCS5, WP_PBES2, cipher,
                 salt, sizeof(salt), WP_PKCS12_ITERATIONS_DEFAULT,
                 HMAC_SHA256_OID, rng, NULL);
         #else
-            rc = wc_EncryptPKCS8Key((byte*)plain, plainLen, out, &outSz,
+            rc = wc_EncryptPKCS8Key((padded != NULL) ? padded : (byte*)plain,
+                encLen, out, &outSz,
                 password, (int)passwordSz, WP_PKCS5, WP_PBES2, cipher,
                 salt, sizeof(salt), WP_PKCS12_ITERATIONS_DEFAULT, rng, NULL);
         #endif
@@ -1191,6 +1292,10 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
         }
     }
 
+    /* The padded copy holds the private key - force zeroization. */
+    if (padded != NULL) {
+        OPENSSL_clear_free(padded, encLen);
+    }
     /* Password is sensitive - force zeroization. */
 #ifdef WOLFSSL_SMALL_STACK
     if (password != NULL) {
