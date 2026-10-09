@@ -1417,6 +1417,49 @@ static int wp_rsa_verify_x931(wp_RsaSigCtx* ctx, const unsigned char* sig,
 }
 
 /**
+ * Left-pad a signature shorter than the modulus with zero bytes.
+ *
+ * OpenPGP MPIs drop leading zero bytes, so callers such as rpm-sequoia pass
+ * signatures shorter than the modulus. OpenSSL's default provider accepts
+ * them on every path except PKCS#1 v1.5 with a digest set, where
+ * ossl_rsa_verify() requires the full length. Do the same.
+ *
+ * @param [in]      ctx     RSA signature context object.
+ * @param [in, out] sig     Signature data. Points at padded copy when padded.
+ * @param [in, out] sigLen  Length of signature data in bytes.
+ * @param [out]     padded  Padded copy to free, or NULL when not padded.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+static int wp_rsa_pad_short_sig(wp_RsaSigCtx* ctx, const unsigned char** sig,
+    size_t* sigLen, unsigned char** padded)
+{
+    int ok = 1;
+    int keyLen = wc_RsaEncryptSize(wp_rsa_get_key(ctx->rsa));
+#if LIBWOLFSSL_VERSION_HEX >= 0x05007004
+    int mdSet = (ctx->hash.type != WC_HASH_TYPE_NONE);
+#else
+    int mdSet = (ctx->hashType != WC_HASH_TYPE_NONE);
+#endif
+
+    *padded = NULL;
+    if ((keyLen > 0) && (*sigLen < (size_t)keyLen) &&
+            !((ctx->padMode == RSA_PKCS1_PADDING) && mdSet)) {
+        *padded = (unsigned char*)OPENSSL_zalloc(keyLen);
+        if (*padded == NULL) {
+            ok = 0;
+        }
+        else {
+            XMEMCPY(*padded + keyLen - *sigLen, *sig, *sigLen);
+            *sig = *padded;
+            *sigLen = (size_t)keyLen;
+        }
+    }
+
+    return ok;
+}
+
+/**
  * Verify an RSA signature.
  *
  * @param [in] ctx     RSA signature context object.
@@ -1441,10 +1484,15 @@ static int wp_rsa_verify(wp_RsaSigCtx* ctx, const unsigned char* sig,
         ok = 0;
     }
     else {
-        unsigned char* decryptedSig = (unsigned char*)OPENSSL_malloc(sigLen);
+        unsigned char* paddedSig = NULL;
+        unsigned char* decryptedSig = NULL;
 
-        if (decryptedSig == NULL) {
-            ok = 0;
+        ok = wp_rsa_pad_short_sig(ctx, &sig, &sigLen, &paddedSig);
+        if (ok) {
+            decryptedSig = (unsigned char*)OPENSSL_malloc(sigLen);
+            if (decryptedSig == NULL) {
+                ok = 0;
+            }
         }
         if (ok) {
             if (ctx->padMode == RSA_PKCS1_PADDING) {
@@ -1468,6 +1516,7 @@ static int wp_rsa_verify(wp_RsaSigCtx* ctx, const unsigned char* sig,
             }
         }
         OPENSSL_free(decryptedSig);
+        OPENSSL_free(paddedSig);
     }
 
     WOLFPROV_LEAVE(WP_LOG_COMP_RSA, __FILE__ ":" WOLFPROV_STRINGIZE(__LINE__), ok);
@@ -1518,6 +1567,7 @@ static int wp_rsa_verify_recover(wp_RsaSigCtx* ctx, unsigned char* rout,
 {
     int rc;
     int ok = 1;
+    unsigned char* paddedSig = NULL;
 
     WOLFPROV_ENTER(WP_LOG_COMP_RSA, "wp_rsa_verify_recover");
 
@@ -1532,6 +1582,9 @@ static int wp_rsa_verify_recover(wp_RsaSigCtx* ctx, unsigned char* rout,
         ok = 0;
     }
 
+    if (ok) {
+        ok = wp_rsa_pad_short_sig(ctx, &sig, &sigLen, &paddedSig);
+    }
     if (ok && ((!WP_FITS_WORD32(sigLen)) || (!WP_FITS_WORD32(routsize)))) {
         ok = 0;
     }
@@ -1546,6 +1599,7 @@ static int wp_rsa_verify_recover(wp_RsaSigCtx* ctx, unsigned char* rout,
     if (ok) {
         *routlen = (size_t)rc;
     }
+    OPENSSL_free(paddedSig);
 
     return ok;
 }
