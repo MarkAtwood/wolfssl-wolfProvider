@@ -23,6 +23,7 @@
 #include <openssl/x509.h>
 #include <openssl/objects.h>
 #include <openssl/err.h>
+#include <openssl/crypto.h>
 
 #include <wolfprovider/settings.h>
 #include <wolfprovider/internal.h>
@@ -94,14 +95,13 @@ typedef struct wp_cast_algo_state {
 
 static wp_cast_algo_state castAlgos[WP_CAST_ALGO_COUNT];
 
+static CRYPTO_ONCE castAlgosOnce = CRYPTO_ONCE_STATIC_INIT;
+
 /**
- * Initialize the cast mutexes on library load.
+ * Initialize the CAST self-test state of every algorithm.
  *
- * This constructor runs when libwolfprov.so is loaded via dlopen() or at
- * program startup. It ensures the castAlgos are initialized before any
- * wolfProvider functions are called.
+ * Run once, through wp_init_cast_mutexes().
  */
-__attribute__((constructor))
 static void wolfprov_init_cast_mutex(void)
 {
     int i;
@@ -109,6 +109,16 @@ static void wolfprov_init_cast_mutex(void)
         wc_InitMutex(&castAlgos[i].mutex);
         castAlgos[i].init = 0;
     }
+}
+
+/**
+ * Initialize the cast mutexes. Runs once.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+int wp_init_cast_mutexes(void)
+{
+    return CRYPTO_THREAD_run_once(&castAlgosOnce, wolfprov_init_cast_mutex);
 }
 
 /**
@@ -590,18 +600,16 @@ enum wc_HashType wp_nid_to_wc_hash_type(int nid)
         case NID_sha512:
             hashType = WC_HASH_TYPE_SHA512;
             break;
-#if LIBWOLFSSL_VERSION_HEX >= 0x05000000
-    #ifndef WOLFSSL_NOSHA512_224
+    #ifdef WP_HAVE_SHA512_224
         case NID_sha512_224:
             hashType = WC_HASH_TYPE_SHA512_224;
             break;
     #endif
-    #ifndef WOLFSSL_NOSHA512_256
+    #ifdef WP_HAVE_SHA512_256
         case NID_sha512_256:
             hashType = WC_HASH_TYPE_SHA512_256;
             break;
     #endif
-#endif
         case NID_sha3_224:
             hashType = WC_HASH_TYPE_SHA3_224;
             break;
@@ -770,9 +778,7 @@ int wp_hash_copy(wc_HashAlg* src, wc_HashAlg* dst, enum wc_HashType hashType)
         rc = wc_Sha512Copy(&src->sha512, &dst->sha512);
 #endif
         break;
-#if LIBWOLFSSL_VERSION_HEX >= 0x05000000
-#if !defined(WOLFSSL_NOSHA512_224) && !defined(HAVE_FIPS) && \
-        !defined(SELF_TEST)
+#ifdef WP_HAVE_SHA512_224
     case WC_HASH_TYPE_SHA512_224:
 #if LIBWOLFSSL_VERSION_HEX >= 0x05007004
         rc = wc_Sha512_224Copy(&src->alg.sha512, &dst->alg.sha512);
@@ -780,9 +786,8 @@ int wp_hash_copy(wc_HashAlg* src, wc_HashAlg* dst, enum wc_HashType hashType)
         rc = wc_Sha512_224Copy(&src->sha512, &dst->sha512);
 #endif
         break;
-#endif /* !WOLFSSL_NOSHA512_224 */
-#if !defined(WOLFSSL_NOSHA512_256) && !defined(HAVE_FIPS) && \
-        !defined(SELF_TEST)
+#endif /* WP_HAVE_SHA512_224 */
+#ifdef WP_HAVE_SHA512_256
     case WC_HASH_TYPE_SHA512_256:
 #if LIBWOLFSSL_VERSION_HEX >= 0x05007004
         rc = wc_Sha512_256Copy(&src->alg.sha512, &dst->alg.sha512);
@@ -790,8 +795,7 @@ int wp_hash_copy(wc_HashAlg* src, wc_HashAlg* dst, enum wc_HashType hashType)
         rc = wc_Sha512_256Copy(&src->sha512, &dst->sha512);
 #endif
         break;
-#endif /* !WOLFSSL_NOSHA512_256 */
-#endif /* LIBWOLFSSL_VERSION_HEX >= 0x05000000 */
+#endif /* WP_HAVE_SHA512_256 */
 #else
     case WC_HASH_TYPE_SHA512:
     case WC_HASH_TYPE_SHA512_224:
@@ -888,6 +892,7 @@ typedef struct wp_cipher {
 #endif
 
 /** wolfSSL compatible cipher names and wolfSSL identifiers. */
+#ifdef WP_HAVE_PKCS8_ENC
 static const wp_cipher wp_cipher_names[] = {
     { "AES-128-CBC", AES128CBCb, "AES-128-CBC" },
     { "AES-192-CBC", AES192CBCb, "AES-192-CBC" },
@@ -900,11 +905,14 @@ static const wp_cipher wp_cipher_names[] = {
 /** Number of cipher names in table.  */
 #define WP_CIPHER_NAMES_LEN    \
     (sizeof(wp_cipher_names) / sizeof(*wp_cipher_names))
+#endif
 
 /**
  * Get the cipher based on the parameters in the array.
  *
- * A parameter with the name of the cipher may not be in the array.
+ * An absent cipher parameter leaves the outputs unchanged. A NULL cipher
+ * value clears the outputs and succeeds. An invalid or unsupported cipher
+ * clears the outputs and fails.
  *
  * @param [in]  params      Array of parameters and values.
  * @param [out] cipher      wolfSSL cipher identifier.
@@ -923,9 +931,22 @@ int wp_cipher_from_params(const OSSL_PARAM params[], int* cipher,
     p = OSSL_PARAM_locate_const(params, OSSL_ALG_PARAM_CIPHER);
     if (p != NULL) {
         if (p->data_type != OSSL_PARAM_UTF8_STRING) {
+            *cipher = 0;
+            if (cipherName != NULL) {
+                *cipherName = NULL;
+            }
             ok = 0;
         }
-        if (ok) {
+        else if (p->data == NULL) {
+            /* OSSL_ENCODER_CTX_set_cipher(ctx, NULL, ...) asks for the
+             * unencrypted encoding, so clear rather than fail. */
+            *cipher = 0;
+            if (cipherName != NULL) {
+                *cipherName = NULL;
+            }
+        }
+        else {
+#ifdef WP_HAVE_PKCS8_ENC
             size_t i;
 
             for (i = 0; i < WP_CIPHER_NAMES_LEN; i++) {
@@ -939,9 +960,24 @@ int wp_cipher_from_params(const OSSL_PARAM params[], int* cipher,
                     break;
                 }
             }
+            /* Unknown cipher. Clear so a previously set cipher cannot drive a
+             * later encode, and fail rather than silently write the key in the
+             * clear. */
             if (i == WP_CIPHER_NAMES_LEN) {
+                *cipher = 0;
+                if (cipherName != NULL) {
+                    *cipherName = NULL;
+                }
                 ok = 0;
             }
+#else
+            /* This build cannot encrypt private keys. */
+            *cipher = 0;
+            if (cipherName != NULL) {
+                *cipherName = NULL;
+            }
+            ok = 0;
+#endif
         }
     }
 
@@ -974,19 +1010,32 @@ int wp_cipher_from_params(const OSSL_PARAM params[], int* cipher,
 int wp_encrypt_key_pkcs8_size(WOLFPROV_CTX* provCtx, int cipher,
     word32 plainLen, size_t* outLen)
 {
-#if defined(HAVE_PKCS8) && !defined(NO_PWDBASED)
+#ifdef WP_HAVE_PKCS8_ENC
     int ok = 1;
     int rc = 0;
     word32 outSz = 0;
+#ifndef WP_SINGLE_THREADED
+    int rngLocked = 0;
+#endif
     byte fakeData[1] = { 0 };
     byte fakeSalt[WP_EPKI_SALT_LEN] = { 0 };
 
     WOLFPROV_ENTER(WP_LOG_COMP_PROVIDER, "wp_encrypt_key_pkcs8_size");
 
-    /* A cipher must be selected to produce an encrypted key. */
-    if (cipher == 0) {
+    /* A provider context, cipher and output length are required. */
+    if ((provCtx == NULL) || (cipher == 0) || (outLen == NULL)) {
         ok = 0;
     }
+#ifndef WP_SINGLE_THREADED
+    /* The IV is drawn from the RNG before the length-only return, so the
+     * shared RNG needs the same lock the encrypt path takes. */
+    if (ok && (wp_provctx_lock_rng(provCtx) != 1)) {
+        ok = 0;
+    }
+    else if (ok) {
+        rngLocked = 1;
+    }
+#endif
     if (ok) {
         /* Passing a NULL output buffer returns the required length. The _ex
          * form (wolfSSL 5.8.2+) selects the HMAC-SHA256 PBKDF2 PRF; older
@@ -1001,6 +1050,14 @@ int wp_encrypt_key_pkcs8_size(WOLFPROV_CTX* provCtx, int cipher,
             WP_PKCS5, WP_PBES2, cipher, fakeSalt, sizeof(fakeSalt),
             WP_PKCS12_ITERATIONS_DEFAULT, wp_provctx_get_rng(provCtx), NULL);
     #endif
+    }
+#ifndef WP_SINGLE_THREADED
+    if (rngLocked) {
+        wp_provctx_unlock_rng(provCtx);
+        rngLocked = 0;
+    }
+#endif
+    if (ok) {
         if (rc != LENGTH_ONLY_E) {
             ok = 0;
         }
@@ -1044,10 +1101,14 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
     unsigned char* out, size_t* outLen,
     OSSL_PASSPHRASE_CALLBACK* pwCb, void* pwCbArg)
 {
-#if defined(HAVE_PKCS8) && !defined(NO_PWDBASED)
+#ifdef WP_HAVE_PKCS8_ENC
     int ok = 1;
     int rc = 0;
-    word32 outSz = (word32)*outLen;
+    word32 outSz = 0;
+    word32 outCap = 0;
+#ifndef WP_SINGLE_THREADED
+    int rngLocked = 0;
+#endif
     byte salt[WP_EPKI_SALT_LEN];
 #ifdef WOLFSSL_SMALL_STACK
     char* password = NULL;
@@ -1055,7 +1116,7 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
     char password[WP_EPKI_PASSWORD_MAX];
 #endif
     size_t passwordSz = WP_EPKI_PASSWORD_MAX;
-    WC_RNG* rng = wp_provctx_get_rng(provCtx);
+    WC_RNG* rng = NULL;
 
     WOLFPROV_ENTER(WP_LOG_COMP_PROVIDER, "wp_encrypt_key_pkcs8");
 
@@ -1068,9 +1129,15 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
 #endif
 
     /* A cipher must be selected and the in/out buffers must differ. */
-    if (ok && ((cipher == 0) || (plain == NULL) || (out == NULL) ||
-            (plain == out))) {
+    if (ok && ((provCtx == NULL) || (cipher == 0) || (plain == NULL) ||
+            (out == NULL) ||
+            (plain == out) || (outLen == NULL) ||
+            (!WP_FITS_WORD32(*outLen)) || (pwCb == NULL))) {
         ok = 0;
+    }
+    if (ok) {
+        rng = wp_provctx_get_rng(provCtx);
+        outSz = outCap = (word32)*outLen;
     }
     /* Get the password from the callback. */
     if (ok && (!pwCb(password, passwordSz, &passwordSz, NULL, pwCbArg))) {
@@ -1080,10 +1147,15 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
     if (ok && (passwordSz > WP_EPKI_PASSWORD_MAX)) {
         ok = 0;
     }
+#ifndef WP_SINGLE_THREADED
+    if (ok && (wp_provctx_lock_rng(provCtx) != 1)) {
+        ok = 0;
+    }
+    else if (ok) {
+        rngLocked = 1;
+    }
+#endif
     if (ok) {
-    #ifndef WP_SINGLE_THREADED
-        wp_provctx_lock_rng(provCtx);
-    #endif
         /* Generate the PBKDF2 salt. */
         rc = wc_RNG_GenerateBlock(rng, salt, sizeof(salt));
         if (rc == 0) {
@@ -1101,16 +1173,21 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
                 salt, sizeof(salt), WP_PKCS12_ITERATIONS_DEFAULT, rng, NULL);
         #endif
         }
-    #ifndef WP_SINGLE_THREADED
+    }
+#ifndef WP_SINGLE_THREADED
+    if (rngLocked) {
         wp_provctx_unlock_rng(provCtx);
-    #endif
-        if (rc <= 0) {
+        rngLocked = 0;
+    }
+#endif
+    if (ok) {
+        if ((rc <= 0) || ((word32)rc > outCap)) {
             WOLFPROV_MSG_DEBUG_RETCODE(WP_LOG_LEVEL_DEBUG, "wc_EncryptPKCS8Key",
                 rc);
             ok = 0;
         }
         else {
-            *outLen = (size_t)outSz;
+            *outLen = (size_t)rc;
         }
     }
 
@@ -1140,7 +1217,7 @@ int wp_encrypt_key_pkcs8(WOLFPROV_CTX* provCtx, int cipher,
 #endif
 }
 
-#if defined(HAVE_PKCS8) && !defined(NO_PWDBASED)
+#ifdef WP_HAVE_PKCS8_ENC
 /* DER encoding of the PBKDF2 OID (1.2.840.113549.1.5.12). */
 static const unsigned char wp_pbkdf2_oid[] = {
     42, 134, 72, 134, 247, 13, 1, 5, 12
@@ -1182,7 +1259,7 @@ static int wp_is_pbkdf2_encrypted(const unsigned char* data, word32 len)
 int wp_decrypt_key_pkcs8(unsigned char* data, word32* len,
     OSSL_PASSPHRASE_CALLBACK* pwCb, void* pwCbArg)
 {
-#if defined(HAVE_PKCS8) && !defined(NO_PWDBASED)
+#ifdef WP_HAVE_PKCS8_ENC
     int ok = 1;
     int rc;
 #ifdef WOLFSSL_SMALL_STACK
@@ -1371,6 +1448,46 @@ int wp_read_pem_bio(WOLFPROV_CTX *provctx, OSSL_CORE_BIO *coreBio,
 }
 
 /**
+ * Write all data to a BIO.
+ *
+ * BIO_write may write fewer bytes than requested. Loop until all data is
+ * written so that a short write does not silently truncate the output.
+ *
+ * @param [in] bio   BIO to write to.
+ * @param [in] data  Data to write.
+ * @param [in] len   Length of data in bytes.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+int wp_write_bio(BIO* bio, const unsigned char* data, size_t len)
+{
+    int ok = 1;
+    size_t off = 0;
+
+    WOLFPROV_ENTER(WP_LOG_COMP_PROVIDER, "wp_write_bio");
+
+    if ((bio == NULL) || (data == NULL)) {
+        ok = 0;
+    }
+
+    while (ok && (off < len)) {
+        int rc = BIO_write(bio, data + off, (int)(len - off));
+        if (rc > 0) {
+            off += (size_t)rc;
+        }
+        else {
+            WOLFPROV_MSG(WP_LOG_COMP_PROVIDER, "BIO_write error (%d) in %s:%d",
+                rc, __FILE__, __LINE__);
+            ok = 0;
+        }
+    }
+
+    WOLFPROV_LEAVE(WP_LOG_COMP_PROVIDER, __FILE__ ":" WOLFPROV_STRINGIZE(__LINE__),
+        ok);
+    return ok;
+}
+
+/**
  * Get the underlying BIO object from the core BIO.
  *
  * @param [in]  coreBio  Core BIO.
@@ -1482,6 +1599,24 @@ byte wp_ct_byte_mask_sel(byte mask, byte a, byte b)
  * them here. Consumed by SSHKDF (mpint length decode) and KBKDF
  * (counter / length encode). */
 
+#if !defined(WOLFSSL_USE_ALIGN) && defined(LITTLE_ENDIAN_ORDER)
+/**
+ * Reverse the byte order of a 32-bit value.
+ *
+ * wolfSSL's ByteReverseWord32() is not exported.
+ *
+ * @param [in] value  Value to reverse the byte order of.
+ * @return  Value with byte order reversed.
+ */
+static word32 wp_byte_reverse_word32(word32 value)
+{
+    return ((value & 0x000000ffU) << 24) |
+           ((value & 0x0000ff00U) <<  8) |
+           ((value & 0x00ff0000U) >>  8) |
+           ((value & 0xff000000U) >> 24);
+}
+#endif /* !WOLFSSL_USE_ALIGN && LITTLE_ENDIAN_ORDER */
+
 void wp_c32toa(word32 wc_u32, byte* c) {
 #ifdef WOLFSSL_USE_ALIGN
     c[0] = (byte)((wc_u32 >> 24) & 0xff);
@@ -1489,7 +1624,7 @@ void wp_c32toa(word32 wc_u32, byte* c) {
     c[2] = (byte)((wc_u32 >>  8) & 0xff);
     c[3] = (byte) (wc_u32 &        0xff);
 #elif defined(LITTLE_ENDIAN_ORDER)
-    *(word32*)c = ByteReverseWord32(wc_u32);
+    *(word32*)c = wp_byte_reverse_word32(wc_u32);
 #else
     *(word32*)c = wc_u32;
 #endif
@@ -1500,9 +1635,8 @@ word32 wp_atoc32(const byte* c) {
     return ((word32)c[0] << 24) | ((word32)c[1] << 16)
          | ((word32)c[2] <<  8) |  (word32)c[3];
 #elif defined(LITTLE_ENDIAN_ORDER)
-    return ByteReverseWord32(*(const word32*)c);
+    return wp_byte_reverse_word32(*(const word32*)c);
 #else
     return *(const word32*)c;
 #endif
 }
-

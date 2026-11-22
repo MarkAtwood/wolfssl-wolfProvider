@@ -26,7 +26,9 @@
 #ifdef WOLFENGINE_USER_SETTINGS
     #include "user_settings.h"
 #endif
-#include <wolfssl/options.h>
+#ifndef WOLFSSL_USER_SETTINGS
+    #include <wolfssl/options.h>
+#endif
 #include <wolfssl/version.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/hash.h>
@@ -199,6 +201,8 @@ void wp_provctx_unlock_rng(WOLFPROV_CTX* provCtx);
 #define WP_CAST_ALGO_DH     6
 #define WP_CAST_ALGO_COUNT  7
 
+int wp_init_cast_mutexes(void);
+
 int wp_init_cast(int algo);
 
 /**
@@ -262,6 +266,7 @@ int wp_decrypt_key_pkcs8(unsigned char* data, word32* len,
 int wp_read_der_bio(WOLFPROV_CTX* provCtx, OSSL_CORE_BIO *coreBio, unsigned char** data, word32* len);
 int wp_read_pem_bio(WOLFPROV_CTX *provctx, OSSL_CORE_BIO *coreBio,
     unsigned char** data, word32* len);
+int wp_write_bio(BIO* bio, const unsigned char* data, size_t len);
 BIO* wp_corebio_get_bio(WOLFPROV_CTX* provCtx, OSSL_CORE_BIO *coreBio);
 
 #ifdef HAVE_FIPS
@@ -283,6 +288,9 @@ BIO* wp_corebio_get_bio(WOLFPROV_CTX* provCtx, OSSL_CORE_BIO *coreBio);
 int wp_decode_should_skip(int castType, const unsigned char* der, word32 len,
     const int* allowedNids, size_t nAllowed);
 #endif /* HAVE_FIPS */
+
+int wp_hmac_tls_dummy_blocks(enum wc_HashType hashType, size_t macSize,
+    size_t tlsDataSize, size_t hashedLen);
 
 byte wp_ct_byte_mask_eq(byte a, byte b);
 byte wp_ct_byte_mask_ne(byte a, byte b);

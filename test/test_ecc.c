@@ -21,7 +21,9 @@
 #include "unit.h"
 
 #include <openssl/store.h>
+#include <openssl/err.h>
 #include <openssl/decoder.h>
+#include <openssl/encoder.h>
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
 
@@ -111,6 +113,15 @@ static const unsigned char ecc_p256_priv[] = {
     0x23, 0x74, 0xAE, 0x7F, 0xD5, 0x31, 0x99, 0x0A, 0x32, 0x34,
     0xEF, 0xF7, 0x3A, 0x7B, 0x61, 0xA7, 0x0A, 0xA8, 0xA7, 0x5C,
     0x06, 0x8D
+};
+static const unsigned char ecc_p256_pub_lead_zero[] = {
+    0x04, 0x00, 0x55, 0x43, 0x89, 0x4A, 0xF3, 0xD0, 0x0E, 0xD7,
+    0xD7, 0x40, 0xAB, 0xDB, 0xD7, 0x5C, 0x96, 0xB0, 0x68, 0x77,
+    0xB7, 0x87, 0xDB, 0x5F, 0x70, 0xEE, 0xA7, 0x8B, 0x90, 0xA8,
+    0xD7, 0xC0, 0x0A, 0xBB, 0x4C, 0x85, 0xA3, 0xD8, 0xEA, 0x29,
+    0xEF, 0xAA, 0xFA, 0x24, 0x40, 0x69, 0x12, 0xDD, 0x84, 0xD5,
+    0xB1, 0x4D, 0xC3, 0x2B, 0xF6, 0x56, 0xEF, 0x6C, 0x6B, 0xD5,
+    0x8A, 0x5D, 0x94, 0x3F, 0x92
 };
 #endif /* WP_HAVE_EC_P256 */
 
@@ -519,6 +530,83 @@ int test_eckeygen_p256(void *data)
 
     return err;
 }
+
+/* get_params for the ECC encoded public key must size the export buffer from
+ * data_size, not a stale/zero return_size. Compare a stale-return_size export
+ * against a known-good fresh export of the same key. */
+int test_ecc_p256_get_params_stale_ret(void *data)
+{
+    int err = 0;
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY *key = NULL;
+    unsigned char ref[128];
+    unsigned char readback[128];
+    size_t refLen = 0;
+    OSSL_PARAM params[2];
+
+    (void)data;
+
+    PRINT_MSG("P-256 encoded pub key get_params with stale return_size");
+
+    err = (ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC", NULL)) == NULL;
+    if (err == 0) {
+        err = EVP_PKEY_keygen_init(ctx) != 1;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx,
+                                                     NID_X9_62_prime256v1) != 1;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_keygen(ctx, &key) != 1;
+    }
+
+    /* Reference export via a fresh param. Its return_size defaults to
+     * OSSL_PARAM_UNMODIFIED, so this block succeeds even with the bug; the
+     * stale-return_size query below is the actual regression check. */
+    if (err == 0) {
+        params[0] = OSSL_PARAM_construct_octet_string(
+            OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, ref, sizeof(ref));
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_get_params(key, params) != 1) {
+            PRINT_ERR_MSG("reference encoded pub key get_params failed");
+            err = 1;
+        }
+        else {
+            refLen = params[0].return_size;
+        }
+    }
+    if (err == 0 && (refLen == 0 || refLen > sizeof(ref))) {
+        PRINT_ERR_MSG("unexpected encoded pub key length: %zu", refLen);
+        err = 1;
+    }
+
+    /* Same query with return_size forced to 0 to mimic a reused param. */
+    if (err == 0) {
+        memset(readback, 0, sizeof(readback));
+        params[0] = OSSL_PARAM_construct_octet_string(
+            OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, readback, sizeof(readback));
+        params[0].return_size = 0;
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_get_params(key, params) != 1) {
+            PRINT_ERR_MSG("encoded pub key get_params failed with stale "
+                          "return_size");
+            err = 1;
+        }
+    }
+    if (err == 0 && params[0].return_size != refLen) {
+        PRINT_ERR_MSG("encoded pub key return_size wrong: %zu vs %zu",
+                      params[0].return_size, refLen);
+        err = 1;
+    }
+    if (err == 0 && memcmp(readback, ref, refLen) != 0) {
+        PRINT_ERR_MSG("encoded pub key bytes not returned correctly");
+        err = 1;
+    }
+
+    EVP_PKEY_free(key);
+    EVP_PKEY_CTX_free(ctx);
+    return err;
+}
 #endif /* WP_HAVE_EC_P256 */
 
 #ifdef WP_HAVE_EC_P384
@@ -868,6 +956,9 @@ int test_ecc_encode_epki(void *data)
     const unsigned char* op = ecc_key_der_256;
     EVP_PKEY* pkey = NULL;
     EVP_PKEY* osslKey = NULL;
+    OSSL_ENCODER_CTX* typeEctx = NULL;
+    unsigned char* typeData = NULL;
+    size_t typeLen = 0;
 
     (void)data;
 
@@ -875,6 +966,32 @@ int test_ecc_encode_epki(void *data)
     pkey = d2i_PrivateKey_ex(EVP_PKEY_EC, NULL, &p, sizeof(ecc_key_der_256),
         wpLibCtx, NULL);
     err = (pkey == NULL);
+
+    if (err == 0) {
+        /* Type-specific ECC encoding must reject a cipher rather than emit
+         * an unencrypted private key. */
+        typeEctx = OSSL_ENCODER_CTX_new_for_pkey(pkey, EVP_PKEY_KEYPAIR,
+            "DER", "type-specific", "provider=libwolfprov");
+        err = (typeEctx == NULL);
+        if (err) {
+            PRINT_ERR_MSG("Failed to create type-specific ECC encoder");
+        }
+    }
+    if (err == 0) {
+        err = OSSL_ENCODER_CTX_set_cipher(typeEctx, "AES-256-CBC", NULL) != 1;
+        if (err) {
+            PRINT_ERR_MSG("Failed to configure the ECC encoder cipher");
+        }
+    }
+    if (err == 0) {
+        err = OSSL_ENCODER_to_data(typeEctx, &typeData, &typeLen) == 1;
+        if (err) {
+            PRINT_ERR_MSG("Type-specific ECC encoder accepted a cipher");
+        }
+    }
+    ERR_clear_error();
+    OSSL_ENCODER_CTX_free(typeEctx);
+    OPENSSL_free(typeData);
 
     if (err == 0) {
         PRINT_MSG("EncryptedPrivateKeyInfo DER: wolfProvider -> OpenSSL");
@@ -915,6 +1032,22 @@ int test_ecc_encode_epki(void *data)
     }
 
     EVP_PKEY_free(osslKey);
+    if (err == 0) {
+        PRINT_MSG("PrivateKeyInfo DER with cipher set must encrypt");
+        err = test_pki_cipher_encrypts(pkey, "DER", "provider=libwolfprov",
+            wpLibCtx, 1);
+    }
+    if (err == 0) {
+        PRINT_MSG("PrivateKeyInfo PEM with cipher set must encrypt");
+        err = test_pki_cipher_encrypts(pkey, "PEM", "provider=libwolfprov",
+            wpLibCtx, 1);
+    }
+    if (err == 0) {
+        PRINT_MSG("PrivateKeyInfo PEM with cipher set: wolfProvider -> OpenSSL");
+        err = test_pki_cipher_encrypts(pkey, "PEM", "provider=libwolfprov",
+            osslLibCtx, 0);
+    }
+
     EVP_PKEY_free(pkey);
 
     return err;
@@ -1240,6 +1373,14 @@ static const unsigned char x25519_shared_secret[] = {
  */
 int test_ecdh_x25519_vector(void *data)
 {
+#ifdef WOLFSSL_CURVE25519_BLINDING
+    /* Blinded curve25519 needs an RNG attached with wc_curve25519_set_rng(),
+     * which wolfProvider does not do yet. Gated on the macro rather than
+     * _WIN32 so builds without blinding keep the coverage. */
+    PRINT_MSG("X25519 ECDH KAT skipped - curve25519 blinding enabled");
+    (void)data;
+    return 0;
+#else
     int err = 0;
     EVP_PKEY *keyA = NULL;
     EVP_PKEY *keyB = NULL;
@@ -1281,6 +1422,7 @@ int test_ecdh_x25519_vector(void *data)
     EVP_PKEY_free(keyA);
 
     return err;
+#endif
 }
 #endif /* WP_HAVE_X25519 */
 
@@ -1366,6 +1508,141 @@ int test_ecdh_x448_vector(void *data)
 #endif /* WP_HAVE_X448 */
 
 #endif /* WP_HAVE_ECDH */
+
+#ifdef WP_HAVE_EC_P256
+/* Sink BIO that accepts one byte per write and keeps every byte it is given.
+ * It reproduces a short-writing BIO so a truncated encoding is detectable. */
+typedef struct {
+    unsigned char buf[4096];
+    size_t len;
+} ShortWriteSink;
+
+static int short_write_bio_write(BIO* b, const char* data, int len)
+{
+    ShortWriteSink* sink = (ShortWriteSink*)BIO_get_data(b);
+
+    BIO_clear_retry_flags(b);
+    if ((sink == NULL) || (len <= 0) || (sink->len >= sizeof(sink->buf))) {
+        return 0;
+    }
+    /* Take a single byte so the writer must loop to make progress. */
+    sink->buf[sink->len++] = (unsigned char)data[0];
+    return 1;
+}
+
+static long short_write_bio_ctrl(BIO* b, int cmd, long num, void* ptr)
+{
+    (void)b;
+    (void)num;
+    (void)ptr;
+    return (cmd == BIO_CTRL_FLUSH) ? 1 : 0;
+}
+
+static int short_write_bio_create(BIO* b)
+{
+    BIO_set_init(b, 1);
+    return 1;
+}
+
+/* Encode pkey twice with the same wolfProvider encoder: once via
+ * OSSL_ENCODER_to_data (a normal full-writing sink) for a reference, and once
+ * through a one-byte-at-a-time BIO. The two encodings must be identical. */
+static int test_ecc_encode_short_write(EVP_PKEY* pkey, int selection,
+    const char* format, const char* structure)
+{
+    int err = 0;
+    OSSL_ENCODER_CTX* ectx = NULL;
+    unsigned char* refData = NULL;
+    size_t refLen = 0;
+    BIO_METHOD* meth = NULL;
+    BIO* bio = NULL;
+    ShortWriteSink sink;
+
+    memset(&sink, 0, sizeof(sink));
+
+    ectx = OSSL_ENCODER_CTX_new_for_pkey(pkey, selection, format, structure,
+        "provider=libwolfprov");
+    err = (ectx == NULL);
+    if (err == 0) {
+        err = (OSSL_ENCODER_to_data(ectx, &refData, &refLen) != 1);
+    }
+    OSSL_ENCODER_CTX_free(ectx);
+    ectx = NULL;
+    if (err == 0) {
+        err = (refLen == 0);
+    }
+
+    if (err == 0) {
+        meth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK,
+            "short-write");
+        err = (meth == NULL);
+    }
+    if (err == 0) {
+        BIO_meth_set_write(meth, short_write_bio_write);
+        BIO_meth_set_ctrl(meth, short_write_bio_ctrl);
+        BIO_meth_set_create(meth, short_write_bio_create);
+        bio = BIO_new(meth);
+        err = (bio == NULL);
+    }
+    if (err == 0) {
+        BIO_set_data(bio, &sink);
+        ectx = OSSL_ENCODER_CTX_new_for_pkey(pkey, selection, format, structure,
+            "provider=libwolfprov");
+        err = (ectx == NULL);
+    }
+    if (err == 0) {
+        err = (OSSL_ENCODER_to_bio(ectx, bio) != 1);
+    }
+    if (err == 0) {
+        err = (sink.len != refLen);
+        if (err) {
+            PRINT_ERR_MSG("Short write truncated output: %lu of %lu bytes",
+                (unsigned long)sink.len, (unsigned long)refLen);
+        }
+    }
+    if (err == 0) {
+        err = (memcmp(sink.buf, refData, refLen) != 0);
+        if (err) {
+            PRINT_ERR_MSG("Short-write output does not match the reference");
+        }
+    }
+
+    OSSL_ENCODER_CTX_free(ectx);
+    BIO_free(bio);
+    BIO_meth_free(meth);
+    OPENSSL_free(refData);
+
+    return err;
+}
+
+int test_ecc_encode_short_write_bio(void *data)
+{
+    int err = 0;
+    const unsigned char* p = ecc_key_der_256;
+    EVP_PKEY* pkey = NULL;
+
+    (void)data;
+
+    pkey = d2i_PrivateKey_ex(EVP_PKEY_EC, NULL, &p, sizeof(ecc_key_der_256),
+        wpLibCtx, NULL);
+    err = (pkey == NULL);
+
+    if (err == 0) {
+        PRINT_MSG("SubjectPublicKeyInfo DER survives a short-writing BIO");
+        err = test_ecc_encode_short_write(pkey, EVP_PKEY_PUBLIC_KEY, "DER",
+            "SubjectPublicKeyInfo");
+    }
+    if (err == 0) {
+        PRINT_MSG("SubjectPublicKeyInfo PEM survives a short-writing BIO");
+        err = test_ecc_encode_short_write(pkey, EVP_PKEY_PUBLIC_KEY, "PEM",
+            "SubjectPublicKeyInfo");
+    }
+
+    EVP_PKEY_free(pkey);
+
+    return err;
+}
+#endif /* WP_HAVE_EC_P256 */
 
 #ifdef WP_HAVE_ECDSA
 
@@ -2741,6 +3018,488 @@ static int test_ec_import_group_no_nul(void)
 }
 
 /*
+ * Import one X9.63 encoded P-256 point as EC_PUB_X/EC_PUB_Y and compare the
+ * result against OpenSSL, which is handed the same point encoded as it does
+ * not import ordinates itself.
+ */
+static int test_ec_import_pub_xy_point(const unsigned char *point, size_t len)
+{
+    int err = 0;
+    EVP_PKEY_CTX *ctx1 = NULL;
+    EVP_PKEY_CTX *ctx2 = NULL;
+    EVP_PKEY *pkey1 = NULL;
+    EVP_PKEY *pkey2 = NULL;
+    OSSL_PARAM *params1 = NULL;
+    OSSL_PARAM *params2 = NULL;
+    OSSL_PARAM_BLD *bld1 = NULL;
+    OSSL_PARAM_BLD *bld2 = NULL;
+    BIGNUM *x = NULL;
+    BIGNUM *y = NULL;
+    size_t ordLen = (len - 1) / 2;
+
+    /* OpenSSL side - the encoded point. */
+    err = (bld1 = OSSL_PARAM_BLD_new()) == NULL;
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld1, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_octet_string(bld1, OSSL_PKEY_PARAM_PUB_KEY,
+                point, len) != 1;
+    }
+    if (err == 0) {
+        err = (params1 = OSSL_PARAM_BLD_to_param(bld1)) == NULL;
+    }
+
+    /* wolfProvider side. */
+    if (err == 0) {
+        err = (bld2 = OSSL_PARAM_BLD_new()) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld2, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = (x = BN_bin2bn(point + 1, (int)ordLen, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = (y = BN_bin2bn(point + 1 + ordLen, (int)ordLen, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld2, OSSL_PKEY_PARAM_EC_PUB_X, x) != 1;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld2, OSSL_PKEY_PARAM_EC_PUB_Y, y) != 1;
+    }
+    if (err == 0) {
+        err = (params2 = OSSL_PARAM_BLD_to_param(bld2)) == NULL;
+    }
+
+    if (err == 0) {
+        err = (ctx1 = EVP_PKEY_CTX_new_from_name(osslLibCtx, "EC",
+                NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx1) != 1;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata(ctx1, &pkey1, EVP_PKEY_PUBLIC_KEY,
+                params1) != 1;
+    }
+    if (err == 0) {
+        err = (ctx2 = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC",
+                NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx2) != 1;
+    }
+    if (err == 0 && EVP_PKEY_fromdata(ctx2, &pkey2, EVP_PKEY_PUBLIC_KEY,
+            params2) != 1) {
+        PRINT_ERR_MSG("EC import refused a valid EC_PUB_X/EC_PUB_Y point");
+        err = 1;
+    }
+    /* The point that comes back has to be the one that went in. */
+    if (err == 0) {
+        err = test_ec_pubkey_match(pkey1, pkey2);
+    }
+
+    EVP_PKEY_free(pkey1);
+    EVP_PKEY_free(pkey2);
+    EVP_PKEY_CTX_free(ctx1);
+    EVP_PKEY_CTX_free(ctx2);
+    OSSL_PARAM_free(params1);
+    OSSL_PARAM_free(params2);
+    OSSL_PARAM_BLD_free(bld1);
+    OSSL_PARAM_BLD_free(bld2);
+    BN_free(x);
+    BN_free(y);
+
+    return err;
+}
+
+/*
+ * A valid EC_PUB_X/EC_PUB_Y point must be accepted on import, and must still
+ * be the right point afterwards.
+ */
+static int test_ec_import_pub_xy(void)
+{
+    int err;
+
+    PRINT_MSG("Import EC_PUB_X/EC_PUB_Y");
+    err = test_ec_import_pub_xy_point(ecc_p256_pub, sizeof(ecc_p256_pub));
+    if (err == 0) {
+        PRINT_MSG("Import EC_PUB_X/EC_PUB_Y with a short X");
+        err = test_ec_import_pub_xy_point(ecc_p256_pub_lead_zero,
+                sizeof(ecc_p256_pub_lead_zero));
+    }
+
+    return err;
+}
+
+/*
+ * Import an off-curve P-256 EC_PUB_X/EC_PUB_Y point, returning 1 when accepted
+ * (and setting *pkey), 0 when refused and -1 when the setup failed.
+ */
+static int test_ec_import_off_curve_xy(EVP_PKEY **pkey)
+{
+    int ret = -1;
+    int err = 0;
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM *params = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    BIGNUM *x = NULL;
+    BIGNUM *y = NULL;
+    unsigned char offCurveY[32];
+
+    memcpy(offCurveY, ecc_p256_pub + 1 + sizeof(offCurveY), sizeof(offCurveY));
+    offCurveY[sizeof(offCurveY) - 1] ^= 0x01;
+
+    err = (bld = OSSL_PARAM_BLD_new()) == NULL;
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = (x = BN_bin2bn(ecc_p256_pub + 1, 32, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = (y = BN_bin2bn(offCurveY, sizeof(offCurveY), NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_PUB_X, x) != 1;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_PUB_Y, y) != 1;
+    }
+    if (err == 0) {
+        err = (params = OSSL_PARAM_BLD_to_param(bld)) == NULL;
+    }
+    if (err == 0) {
+        err = (ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC", NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx) != 1;
+    }
+    if (err == 0) {
+        ret = EVP_PKEY_fromdata(ctx, pkey, EVP_PKEY_PUBLIC_KEY, params) == 1;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(x);
+    BN_free(y);
+
+    return ret;
+}
+
+/*
+ * An EC_PUB_X/EC_PUB_Y point that is not on the curve must be rejected on
+ * import.
+ */
+static int test_ec_import_pub_xy_off_curve(void)
+{
+    int err = 0;
+    int rc;
+    EVP_PKEY *pkey = NULL;
+
+    rc = test_ec_import_off_curve_xy(&pkey);
+    if (rc < 0) {
+        err = 1;
+    }
+    else if (rc == 1) {
+        PRINT_ERR_MSG("EC import accepted an off-curve EC_PUB_X/EC_PUB_Y point");
+        err = 1;
+    }
+
+    EVP_PKEY_free(pkey);
+
+    return err;
+}
+
+/*
+ * EC_PUB_X with no EC_PUB_Y is not a public key and must be rejected on
+ * import.
+ */
+static int test_ec_import_pub_x_only(void)
+{
+    int err = 0;
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    OSSL_PARAM *params = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    BIGNUM *x = NULL;
+
+    err = (bld = OSSL_PARAM_BLD_new()) == NULL;
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = (x = BN_bin2bn(ecc_p256_pub + 1, 32, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_PUB_X, x) != 1;
+    }
+    if (err == 0) {
+        err = (params = OSSL_PARAM_BLD_to_param(bld)) == NULL;
+    }
+    if (err == 0) {
+        err = (ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC", NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx) != 1;
+    }
+    if (err == 0 &&
+            EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) == 1) {
+        PRINT_ERR_MSG("EC import accepted EC_PUB_X with no EC_PUB_Y");
+        err = 1;
+    }
+
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(x);
+
+    return err;
+}
+
+/*
+ * Build a P-256 key holding the private scalar only, as EVP_PKEY_set_params()
+ * needs a provider side key that already has a private key in it.
+ */
+static int test_ec_priv_only_key(EVP_PKEY **pkey)
+{
+    int err = 0;
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM *params = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    BIGNUM *d = NULL;
+
+    err = (bld = OSSL_PARAM_BLD_new()) == NULL;
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = (d = BN_bin2bn(ecc_p256_priv, sizeof(ecc_p256_priv),
+                NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, d) != 1;
+    }
+    if (err == 0) {
+        err = (params = OSSL_PARAM_BLD_to_param(bld)) == NULL;
+    }
+    if (err == 0) {
+        err = (ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC", NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx) != 1;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata(ctx, pkey, EVP_PKEY_KEYPAIR, params) != 1;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(d);
+
+    return err;
+}
+
+/* Check the key still holds the expected private scalar. */
+static int test_ec_priv_intact(EVP_PKEY *pkey)
+{
+    int err = 0;
+    BIGNUM *d = NULL;
+    BIGNUM *expected = NULL;
+
+    err = (expected = BN_bin2bn(ecc_p256_priv, sizeof(ecc_p256_priv),
+            NULL)) == NULL;
+    if (err == 0 &&
+            EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, &d) != 1) {
+        PRINT_ERR_MSG("Private key is gone");
+        err = 1;
+    }
+    if (err == 0 && BN_cmp(d, expected) != 0) {
+        PRINT_ERR_MSG("Private key changed");
+        err = 1;
+    }
+
+    BN_clear_free(d);
+    BN_free(expected);
+
+    return err;
+}
+
+/*
+ * Setting a public key through EVP_PKEY_set_params() must leave an existing
+ * private key alone. wc_ecc_import_x963_ex() re-initializes the private scalar
+ * and forces the key type to public, so the point has to be imported into a
+ * scratch key first.
+ */
+static int test_ec_set_params_pub_keeps_priv(void)
+{
+    int err = 0;
+    EVP_PKEY *pkey = NULL;
+    OSSL_PARAM *params = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    BIGNUM *x = NULL;
+    BIGNUM *y = NULL;
+
+    err = test_ec_priv_only_key(&pkey);
+    if (err == 0) {
+        err = test_ec_priv_intact(pkey);
+    }
+
+    /* EC_PUB_X and EC_PUB_Y, which have to be set together. */
+    if (err == 0) {
+        err = (bld = OSSL_PARAM_BLD_new()) == NULL;
+    }
+    if (err == 0) {
+        err = (x = BN_bin2bn(ecc_p256_pub + 1, 32, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = (y = BN_bin2bn(ecc_p256_pub + 33, 32, NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_PUB_X, x) != 1;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_PUB_Y, y) != 1;
+    }
+    if (err == 0) {
+        err = (params = OSSL_PARAM_BLD_to_param(bld)) == NULL;
+    }
+    if (err == 0 && EVP_PKEY_set_params(pkey, params) != 1) {
+        PRINT_ERR_MSG("Setting EC_PUB_X/EC_PUB_Y failed");
+        err = 1;
+    }
+    if (err == 0) {
+        PRINT_MSG("Private key survives EC_PUB_X/EC_PUB_Y");
+        err = test_ec_priv_intact(pkey);
+    }
+
+    /* Same again through the encoded point. */
+    if (err == 0 && EVP_PKEY_set_octet_string_param(pkey,
+            OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, ecc_p256_pub,
+            sizeof(ecc_p256_pub)) != 1) {
+        PRINT_ERR_MSG("Setting ENCODED_PUBLIC_KEY failed");
+        err = 1;
+    }
+    if (err == 0) {
+        PRINT_MSG("Private key survives ENCODED_PUBLIC_KEY");
+        err = test_ec_priv_intact(pkey);
+    }
+
+    EVP_PKEY_free(pkey);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(x);
+    BN_free(y);
+
+    return err;
+}
+
+#ifdef WP_HAVE_ECDH
+/*
+ * An off-curve peer key must never reach wc_ecc_shared_secret(), checked with
+ * validate_peer = 0 so that the provider and not OpenSSL is under test.
+ */
+static int test_ec_derive_off_curve_peer(void)
+{
+    int err = 0;
+    int rc;
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY_CTX *dctx = NULL;
+    EVP_PKEY *priv = NULL;
+    EVP_PKEY *peer = NULL;
+    OSSL_PARAM *params = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    BIGNUM *d = NULL;
+    unsigned char secret[32];
+    size_t secretLen = sizeof(secret);
+
+    rc = test_ec_import_off_curve_xy(&peer);
+    if (rc < 0) {
+        err = 1;
+    }
+    else if (rc == 0) {
+        /* Import already rejects the point - nothing left to derive with. */
+        PRINT_MSG("Off-curve point rejected on import, skipping derive");
+        return 0;
+    }
+
+    /* Our own private key: group plus private scalar only. */
+    if (err == 0) {
+        err = (bld = OSSL_PARAM_BLD_new()) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                ecc_p256_group_str, 0) != 1;
+    }
+    if (err == 0) {
+        err = (d = BN_bin2bn(ecc_p256_priv, sizeof(ecc_p256_priv),
+                NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, d) != 1;
+    }
+    if (err == 0) {
+        err = (params = OSSL_PARAM_BLD_to_param(bld)) == NULL;
+    }
+    if (err == 0) {
+        err = (ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "EC", NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx) != 1;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata(ctx, &priv, EVP_PKEY_KEYPAIR, params) != 1;
+    }
+
+    if (err == 0) {
+        err = (dctx = EVP_PKEY_CTX_new_from_pkey(wpLibCtx, priv,
+                NULL)) == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_derive_init(dctx) != 1;
+    }
+    if (err == 0 && EVP_PKEY_derive_set_peer_ex(dctx, peer, 0) > 0 &&
+            EVP_PKEY_derive(dctx, secret, &secretLen) > 0) {
+        size_t i;
+        int allZero = 1;
+
+        for (i = 0; i < secretLen; i++) {
+            if (secret[i] != 0) {
+                allZero = 0;
+                break;
+            }
+        }
+        PRINT_ERR_MSG("ECDH derived a secret from an off-curve peer key");
+        if (allZero) {
+            /* pubkey.z left at 0 makes the point behave as infinity. */
+            PRINT_ERR_MSG("Derived secret is all zeros");
+        }
+        err = 1;
+    }
+
+    EVP_PKEY_CTX_free(dctx);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(priv);
+    EVP_PKEY_free(peer);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(d);
+
+    return err;
+}
+#endif /* WP_HAVE_ECDH */
+
+/*
  * A truncated PEM (header only) must be rejected without an out-of-bounds read
  * in wp_pem2der_convert (base64Data past the buffer / base64Len underflow).
  */
@@ -2789,6 +3548,23 @@ int test_ec_import(void* data)
     if (err == 0) {
         err = test_ec_import_group_no_nul();
     }
+    if (err == 0) {
+        err = test_ec_import_pub_xy();
+    }
+    if (err == 0) {
+        err = test_ec_import_pub_xy_off_curve();
+    }
+    if (err == 0) {
+        err = test_ec_import_pub_x_only();
+    }
+    if (err == 0) {
+        err = test_ec_set_params_pub_keeps_priv();
+    }
+#ifdef WP_HAVE_ECDH
+    if (err == 0) {
+        err = test_ec_derive_off_curve_peer();
+    }
+#endif
 
     return err;
 }

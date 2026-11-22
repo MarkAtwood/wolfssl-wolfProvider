@@ -1,3 +1,92 @@
+# wolfProvider version 1.2.2 (August 27, 2026)
+
+Release 1.2.2 has been developed according to wolfSSL's development and QA
+process and successfully passed the quality criteria.
+
+PR stands for Pull Request, and PR <NUMBER> references a GitHub pull request
+number where the code change was added.
+
+## New Feature Additions
+* Add a Windows/Visual Studio 2022 port that builds libwolfprov.dll against a
+  user_settings.h-configured wolfSSL and OpenSSL 3.x, for both non-FIPS and FIPS
+  (PR 464).
+* Encrypt PKCS#8 private keys when a cipher is set on the PrivateKeyInfo encoder,
+  with CLI coverage (PR 453).
+
+## Enhancements and Optimizations
+* Restore the default FIPS policy mask in WOLFSSL_USER_SETTINGS builds, add
+  portable FIPS CAST-mutex initialization, and balance wolfCrypt init and
+  cleanup (PR 464).
+* Stop advertising SHA-512/224 and SHA-512/256 in FIPS and self-test builds
+  (PR 464).
+* Match OpenSSL ML-KEM NULL output handling (PR 458).
+* Tighten PKCS#8 feature guards and expand PKCS#8 cipher-rejection test coverage.
+* Expand the hostap smoke and EAP test coverage in CI and pin the UML kernel to
+  Linux 7.2 (PR 469).
+* Run PQC workflows when pull requests become ready and skip them on drafts
+  (PR 456).
+* Add IVs to PBES2 test parameters and wait for OpenSSL test-server readiness in
+  CI.
+* Add CONTRIBUTING.md covering the contributor agreement and PR process (PR 466).
+
+## Vulnerabilities
+* [High] CVE-2026-81019 - AES-GCM explicit nonce reuse on TLS 1.2 and DTLS 1.2
+  records. The 8-byte explicit nonce was generated when the fixed IV was
+  configured and was not incremented for each record, so successive AES-GCM
+  records processed by the same encryption context reused the same key and
+  nonce. Reusing a GCM key and nonce weakens confidentiality (identical keystream
+  across records) and integrity (authentication tag forgery). AES-CCM, TLS 1.3,
+  and non-TLS use of AES-GCM are not affected. Affects wolfProvider 1.0.0 through
+  1.2.1, FIPS and non-FIPS. Update to 1.2.2.
+
+## Bug Fixes
+* Validate the X25519 public key length before reading the input buffer
+  (PR 457).
+* Keep declarations first in the X25519 blinding skip.
+* Fix ECX/ECC get_params to size the export buffer from data_size (PR 447).
+* Address PKCS#8 security-review findings.
+* Use fixed GMAC and CMAC tag lengths in the final operation.
+* Correct the AEAD input-cache parameter documentation.
+* Release the RNG mutex only when it was acquired during fixed-IV setup.
+* Reset AEAD authentication error state on decrypt reinitialization so a
+  poisoned context can be recovered.
+* Reset the AEAD tag-available state on reinitialization so a reused context
+  cannot skip tag verification.
+* Additional AES-AEAD IV bounds and authentication-state hardening.
+
+# wolfProvider version 1.2.1 (July 16, 2026)
+
+Release 1.2.1 has been developed according to wolfSSL's development and QA
+process and successfully passed the quality criteria.
+
+PR stands for Pull Request, and PR <NUMBER> references a GitHub pull request
+number where the code change was added.
+
+## New Feature Additions
+* Add ML-KEM (FIPS 203) and ML-DSA (FIPS 204) post-quantum support via `--enable-pqc` (PR 399)
+
+## Enhancements and Optimizations
+* Route KDF key-exchange and MAC-signature operations through wolfProvider directly (PR 429)
+* Strengthen RSA key import and CRT validation (PR 339)
+* Enforce DH minimum prime size on the parameters-only generation path
+* Add bounds checks on OSSL_PARAMS for EC, DH, and RSA (PR 398)
+* Add input validation, memory-safety, and key zeroization hardening (PR 420, PR 438, PR 441)
+* Add nightly OpenSSL command performance regression testing (PR 411)
+
+## Bug Fixes
+* Fix FIPS decode performance regression where decoders ran self-tests on non-matching keys before checking the key type, and serialize the RSA self-test to close a concurrent decode race (PR 413)
+* Fix EncryptedPrivateKeyInfo (PBES2) encode and decode across all key types (PR 426)
+* Fix AES-GCM TLS IV length check and AEAD tag length validation (PR 416)
+* Fix integer overflow in DH derive (PR 439)
+* Fix TLS1 PRF to reject unsupported digests instead of defaulting to SHA-384, and report FIPS module failures through the provider running check (PR 431)
+* Fix ECX security-bits reporting for X25519 and X448 (PR 417)
+* Constrain file store decoders to the caller's provider boundary (PR 430)
+* Gate secp192r1/P-192 TLS group advertisement on curve availability (PR 432)
+* Gate DRBG reseed on FIPS version (PR 408)
+* Fix DH FFC_Q export for PKCS#3 keys for OpenSSL 3.6.3 interop (PR 406)
+* Fix seed-src to read /dev/urandom via a raw fd, avoiding seccomp failures in restrictive sandboxes (PR 440)
+* Fix macOS library path handling in build scripts (PR 443, PR 444)
+
 # wolfProvider version 1.2.0 (June 08, 2026)
 
 Release 1.2.0 has been developed according to wolfSSL's development and QA
@@ -44,7 +133,6 @@ PR stands for Pull Request, and PR <NUMBER> references a GitHub pull request
 number where the code change was added.
 
 ## New Feature Additions
-* Add ML-KEM (FIPS 203) and ML-DSA (FIPS 204) post-quantum algorithm support via `--enable-pqc` (PR 399)
 * Add OpenSSL FIPS baseline process implementation (PR 357)
 * Add seed-src handling for wolfProvider (PR 350)
 * Add EC public key auto derivation from private key (PR 338)

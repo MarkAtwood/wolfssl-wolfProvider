@@ -25,6 +25,10 @@
 #include <openssl/param_build.h>
 #include <wolfssl/wolfcrypt/ed25519.h>
 #include <wolfssl/wolfcrypt/ed448.h>
+#if defined(HAVE_PTHREAD) || defined(_POSIX_THREADS)
+#include <pthread.h>
+#define WP_HAVE_ECX_SHARED_KEY_TEST
+#endif
 
 #ifndef ARRAY_SIZE
     #define ARRAY_SIZE(a)   ((sizeof(a)/sizeof(a[0])))
@@ -149,9 +153,22 @@ int test_ecx_encode_epki(void *data)
         wpLibCtx, NULL);
     err = (pkey == NULL);
 
-    /* wolfProvider self round-trip (DER and PEM). ECX plaintext PKCS#8 is
-     * block-aligned, so wolfProvider -> OpenSSL interop additionally depends on
-     * a wolfSSL PKCS#7 padding fix and is not asserted here. */
+    /* Ed25519's PKCS#8 is an exact AES block multiple, the case needing a whole
+     * extra PKCS#7 pad block. wolfSSL omitted it until wc_EncryptPKCS8Key_ex
+     * was fixed after v5.9.2-stable, and its own decoder accepts the short
+     * form, so only OpenSSL catches it. Assert once a release carries the fix. */
+#if LIBWOLFSSL_VERSION_HEX > 0x05009002
+    if (err == 0) {
+        PRINT_MSG("EncryptedPrivateKeyInfo DER: wolfProvider -> OpenSSL");
+        err = test_epki_encode_decode(pkey, "DER", "provider=libwolfprov",
+            osslLibCtx);
+    }
+    if (err == 0) {
+        PRINT_MSG("EncryptedPrivateKeyInfo PEM: wolfProvider -> OpenSSL");
+        err = test_epki_encode_decode(pkey, "PEM", "provider=libwolfprov",
+            osslLibCtx);
+    }
+#endif
     if (err == 0) {
         PRINT_MSG("EncryptedPrivateKeyInfo DER: wolfProvider -> wolfProvider");
         err = test_epki_encode_decode(pkey, "DER", "provider=libwolfprov",
@@ -161,6 +178,17 @@ int test_ecx_encode_epki(void *data)
         PRINT_MSG("EncryptedPrivateKeyInfo PEM: wolfProvider -> wolfProvider");
         err = test_epki_encode_decode(pkey, "PEM", "provider=libwolfprov",
             wpLibCtx);
+    }
+
+    if (err == 0) {
+        PRINT_MSG("PrivateKeyInfo DER with cipher set must encrypt");
+        err = test_pki_cipher_encrypts(pkey, "DER", "provider=libwolfprov",
+            wpLibCtx, 1);
+    }
+    if (err == 0) {
+        PRINT_MSG("PrivateKeyInfo PEM with cipher set must encrypt");
+        err = test_pki_cipher_encrypts(pkey, "PEM", "provider=libwolfprov",
+            wpLibCtx, 1);
     }
 
     EVP_PKEY_free(pkey);
@@ -792,6 +820,118 @@ int test_ecx_x25519_raw_priv_roundtrip(void *data)
     return err;
 }
 
+/* get_params must size the export buffer from the caller's data_size, not
+ * return_size. A reused param can carry a stale/zero return_size from a prior
+ * size query; using it would truncate or fail the export. */
+int test_ecx_x25519_get_params_stale_ret(void *data)
+{
+#ifdef WOLFSSL_CURVE25519_BLINDING
+    /* Blinded curve25519 needs an RNG attached with wc_curve25519_set_rng(),
+     * which wolfProvider does not do yet. Gated on the macro rather than
+     * _WIN32 so builds without blinding keep the coverage. */
+    PRINT_MSG("X25519 get_params test skipped - curve25519 blinding enabled");
+    (void)data;
+    return 0;
+#else
+    int err = 0;
+    EVP_PKEY *pkey = NULL;
+    static const unsigned char privKey[] = {
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
+        0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+        0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
+        0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a
+    };
+    /* RFC 7748 Section 6.1 Alice public key, derived from privKey above. */
+    static const unsigned char pubKey[] = {
+        0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54,
+        0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e, 0xf7, 0x5a,
+        0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4,
+        0xeb, 0xa4, 0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a
+    };
+    unsigned char readback[32];
+    OSSL_PARAM params[2];
+
+    (void)data;
+
+    PRINT_MSG("X25519 get_params with stale (zero) return_size");
+
+    pkey = EVP_PKEY_new_raw_private_key_ex(wpLibCtx, "X25519", NULL,
+        privKey, sizeof(privKey));
+    if (pkey == NULL) {
+        PRINT_ERR_MSG("Failed to import X25519 private key");
+        err = 1;
+    }
+
+    /* Private key: full 32-byte buffer but return_size forced to 0. */
+    if (err == 0) {
+        memset(readback, 0, sizeof(readback));
+        params[0] = OSSL_PARAM_construct_octet_string(
+            OSSL_PKEY_PARAM_PRIV_KEY, readback, sizeof(readback));
+        params[0].return_size = 0;
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_get_params(pkey, params) != 1) {
+            PRINT_ERR_MSG("priv key get_params failed with stale return_size");
+            err = 1;
+        }
+    }
+    if (err == 0 && params[0].return_size != sizeof(privKey)) {
+        PRINT_ERR_MSG("priv key return_size wrong: %zu", params[0].return_size);
+        err = 1;
+    }
+    if (err == 0 && memcmp(readback, privKey, sizeof(privKey)) != 0) {
+        PRINT_ERR_MSG("priv key bytes not returned correctly");
+        err = 1;
+    }
+
+    /* Public key: same stale-return_size condition on the export path. */
+    if (err == 0) {
+        memset(readback, 0, sizeof(readback));
+        params[0] = OSSL_PARAM_construct_octet_string(
+            OSSL_PKEY_PARAM_PUB_KEY, readback, sizeof(readback));
+        params[0].return_size = 0;
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_get_params(pkey, params) != 1) {
+            PRINT_ERR_MSG("pub key get_params failed with stale return_size");
+            err = 1;
+        }
+    }
+    if (err == 0 && params[0].return_size != sizeof(pubKey)) {
+        PRINT_ERR_MSG("pub key return_size wrong: %zu", params[0].return_size);
+        err = 1;
+    }
+    if (err == 0 && memcmp(readback, pubKey, sizeof(pubKey)) != 0) {
+        PRINT_ERR_MSG("pub key bytes not returned correctly");
+        err = 1;
+    }
+
+    /* Encoded public key: same helper, exercised via its own key string. */
+    if (err == 0) {
+        memset(readback, 0, sizeof(readback));
+        params[0] = OSSL_PARAM_construct_octet_string(
+            OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, readback, sizeof(readback));
+        params[0].return_size = 0;
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_get_params(pkey, params) != 1) {
+            PRINT_ERR_MSG("enc pub key get_params failed with stale "
+                          "return_size");
+            err = 1;
+        }
+    }
+    if (err == 0 && params[0].return_size != sizeof(pubKey)) {
+        PRINT_ERR_MSG("enc pub key return_size wrong: %zu",
+                      params[0].return_size);
+        err = 1;
+    }
+    if (err == 0 && memcmp(readback, pubKey, sizeof(pubKey)) != 0) {
+        PRINT_ERR_MSG("enc pub key bytes not returned correctly");
+        err = 1;
+    }
+
+    EVP_PKEY_free(pkey);
+    return err;
+#endif
+}
+
 /* A zero-length private key octet string must be rejected without an
  * out-of-bounds read (privData[len-1] with len==0). */
 int test_ecx_import_zero_priv(void *data)
@@ -825,6 +965,77 @@ int test_ecx_import_zero_priv(void *data)
         }
     }
 
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(ctx);
+    OPENSSL_free(buf);
+    return err;
+}
+
+/* An undersized public key octet string must be rejected without an
+ * out-of-bounds read (in[31] and a 32-byte copy out of a shorter buffer).
+ * The buffer is heap allocated so ASan sees the overread. */
+int test_ecx_import_short_pub(void *data)
+{
+    int err = 0;
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY *setPkey = NULL;
+    unsigned char *buf = NULL;
+    /* RFC 7748 Section 6.1 Alice private key. */
+    static const unsigned char privKey[] = {
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
+        0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+        0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
+        0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a
+    };
+    /* Deliberately shorter than CURVE25519_KEYSIZE. */
+    const size_t shortLen = 4;
+    OSSL_PARAM params[2];
+
+    (void)data;
+
+    PRINT_MSG("X25519 import of undersized public key");
+
+    buf = OPENSSL_malloc(shortLen);
+    if (buf == NULL) {
+        err = 1;
+    }
+    if (err == 0) {
+        /* Top bit of the last byte set is what triggers the 32-byte copy. */
+        memset(buf, 0xff, shortLen);
+        ctx = EVP_PKEY_CTX_new_from_name(wpLibCtx, "X25519", NULL);
+        err = ctx == NULL;
+    }
+    if (err == 0) {
+        err = EVP_PKEY_fromdata_init(ctx) != 1;
+    }
+    if (err == 0) {
+        params[0] = OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
+            buf, shortLen);
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) == 1) {
+            PRINT_ERR_MSG("X25519 fromdata accepted short public key");
+            err = 1;
+        }
+    }
+
+    /* Same undersized buffer through the encoded public key set_params path. */
+    if (err == 0) {
+        setPkey = EVP_PKEY_new_raw_private_key_ex(wpLibCtx, "X25519", NULL,
+            privKey, sizeof(privKey));
+        if (setPkey == NULL) {
+            PRINT_ERR_MSG("Failed to import X25519 private key");
+            err = 1;
+        }
+    }
+    if (err == 0) {
+        if (EVP_PKEY_set1_encoded_public_key(setPkey, buf, shortLen) == 1) {
+            PRINT_ERR_MSG("X25519 set1_encoded_public_key accepted short key");
+            err = 1;
+        }
+    }
+
+    EVP_PKEY_free(setPkey);
     EVP_PKEY_free(pkey);
     EVP_PKEY_CTX_free(ctx);
     OPENSSL_free(buf);
@@ -965,6 +1176,326 @@ int test_ecx_dup(void *data)
 #endif /* WP_HAVE_ED448 */
 
     return err;
+}
+
+#ifdef WP_HAVE_ECX_SHARED_KEY_TEST
+/* Fixed, small workload: any failure is a defect, not bad timing. */
+#define WP_ECX_SHARED_THREADS   4
+#define WP_ECX_SHARED_TRIALS    2
+#define WP_ECX_SHARED_MSG       "wp-ecx-shared-key"
+/* Shared helpers run for whichever EdDSA types are built. Size the
+ * buffers from the types that exist so an Ed25519-only build compiles. */
+#if defined(WP_HAVE_ED25519) && defined(WP_HAVE_ED448)
+#define WP_ECX_SHARED_SIG_SIZE  MAX(ED25519_SIG_SIZE, ED448_SIG_SIZE)
+#define WP_ECX_SHARED_PUB_SIZE  MAX(ED25519_PUB_KEY_SIZE, ED448_PUB_KEY_SIZE)
+#elif defined(WP_HAVE_ED448)
+#define WP_ECX_SHARED_SIG_SIZE  ED448_SIG_SIZE
+#define WP_ECX_SHARED_PUB_SIZE  ED448_PUB_KEY_SIZE
+#else
+#define WP_ECX_SHARED_SIG_SIZE  ED25519_SIG_SIZE
+#define WP_ECX_SHARED_PUB_SIZE  ED25519_PUB_KEY_SIZE
+#endif
+
+/* Worker modes: sign and export are first uses of the shared private-only
+ * key; verify runs on a shared wolfProvider public key to exercise the verify
+ * lock under contention. */
+#define WP_ECX_MODE_SIGN    0
+#define WP_ECX_MODE_EXPORT  1
+#define WP_ECX_MODE_VERIFY  2
+
+typedef struct {
+    EVP_PKEY*            key;
+    EVP_PKEY*            verifyKey;
+    const unsigned char* pub;
+    size_t               pubLen;
+    size_t               sigLen;
+    unsigned char*       vsig;
+    size_t               vsigLen;
+    const char*          algName;
+    /* Start gate: the parent releases every worker together, but only after
+     * each one has parked on startCond. A worker bumps ready and signals
+     * readyCond; the parent waits for all workers before it sets start. The
+     * mutex and condition variables give a real happens-before edge - a plain
+     * shared flag would itself be a data race. */
+    pthread_mutex_t*     lock;
+    pthread_cond_t*      startCond;
+    pthread_cond_t*      readyCond;
+    int*                 start;
+    int*                 ready;
+    int                  mode;
+    int                  err;
+} wp_ecx_shared_args;
+
+/*
+ * Sign with the shared key and verify against a separate public-only key, so
+ * a bad public half on the shared key cannot hide a bad signature.
+ */
+static int wp_ecx_shared_sign(wp_ecx_shared_args* w)
+{
+    int err;
+    unsigned char sig[WP_ECX_SHARED_SIG_SIZE];
+    size_t sigLen = w->sigLen;
+    unsigned char msg[] = WP_ECX_SHARED_MSG;
+    EVP_PKEY* pubKey = NULL;
+
+    err = test_digest_sign(w->key, wpLibCtx, msg, sizeof(msg) - 1, NULL, NULL,
+        sig, &sigLen, 0, 0);
+    if (err == 0) {
+        pubKey = EVP_PKEY_new_raw_public_key_ex(osslLibCtx, w->algName, NULL,
+            w->pub, w->pubLen);
+        err = (pubKey == NULL);
+    }
+    if (err == 0) {
+        err = test_digest_verify(pubKey, osslLibCtx, msg, sizeof(msg) - 1,
+            NULL, NULL, sig, sigLen, 0, 0);
+    }
+
+    EVP_PKEY_free(pubKey);
+    return err;
+}
+
+/* Export the public key of the shared key and check the value. */
+static int wp_ecx_shared_get_pub(wp_ecx_shared_args* w)
+{
+    int err;
+    unsigned char pub[WP_ECX_SHARED_PUB_SIZE];
+    size_t pubLen = sizeof(pub);
+
+    err = EVP_PKEY_get_raw_public_key(w->key, pub, &pubLen) != 1;
+    if (err == 0) {
+        err = (pubLen != w->pubLen) || (memcmp(pub, w->pub, pubLen) != 0);
+    }
+
+    return err;
+}
+
+/*
+ * Verify a precomputed valid signature through wolfProvider on a public key
+ * shared with the other verify workers. Concurrent verify exercises the key
+ * mutex that protects the wolfProvider verification state.
+ */
+static int wp_ecx_shared_verify(wp_ecx_shared_args* w)
+{
+    unsigned char msg[] = WP_ECX_SHARED_MSG;
+
+    return test_digest_verify(w->verifyKey, wpLibCtx, msg, sizeof(msg) - 1,
+        NULL, NULL, w->vsig, w->vsigLen, 0, 0);
+}
+
+static void* wp_ecx_shared_key_thread(void* arg)
+{
+    wp_ecx_shared_args* w = (wp_ecx_shared_args*)arg;
+
+    /* Tell the parent this worker is parked, then wait so that every worker
+     * reaches its first use of the key together. */
+    pthread_mutex_lock(w->lock);
+    (*w->ready)++;
+    pthread_cond_broadcast(w->readyCond);
+    while (*w->start == 0) {
+        pthread_cond_wait(w->startCond, w->lock);
+    }
+    pthread_mutex_unlock(w->lock);
+
+    if (w->mode == WP_ECX_MODE_EXPORT) {
+        w->err = wp_ecx_shared_get_pub(w);
+    }
+    else if (w->mode == WP_ECX_MODE_VERIFY) {
+        w->err = wp_ecx_shared_verify(w);
+    }
+    else {
+        w->err = wp_ecx_shared_sign(w);
+    }
+
+    return NULL;
+}
+
+/*
+ * Create the workers, hold them at the start gate until all have parked, then
+ * release them together and join. Returns non-zero if any worker failed or a
+ * thread could not be created.
+ */
+static int wp_ecx_run_workers(wp_ecx_shared_args* workers, int count)
+{
+    pthread_t tids[WP_ECX_SHARED_THREADS];
+    pthread_mutex_t lock;
+    pthread_cond_t startCond;
+    pthread_cond_t readyCond;
+    int start = 0;
+    int ready = 0;
+    int created = 0;
+    int err = 0;
+    int i;
+
+    if ((pthread_mutex_init(&lock, NULL) != 0) ||
+            (pthread_cond_init(&startCond, NULL) != 0) ||
+            (pthread_cond_init(&readyCond, NULL) != 0)) {
+        PRINT_ERR_MSG("Failed to init start primitives");
+        return 1;
+    }
+
+    for (i = 0; i < count; i++) {
+        workers[i].lock = &lock;
+        workers[i].startCond = &startCond;
+        workers[i].readyCond = &readyCond;
+        workers[i].start = &start;
+        workers[i].ready = &ready;
+        if (pthread_create(&tids[i], NULL, wp_ecx_shared_key_thread,
+                &workers[i]) != 0) {
+            PRINT_ERR_MSG("Failed to create thread %d", i);
+            err = 1;
+            break;
+        }
+        created++;
+    }
+
+    /* Wait until every worker has parked, then release them together so they
+     * hit the first use at the same time. */
+    pthread_mutex_lock(&lock);
+    while (ready < created) {
+        pthread_cond_wait(&readyCond, &lock);
+    }
+    start = 1;
+    pthread_cond_broadcast(&startCond);
+    pthread_mutex_unlock(&lock);
+
+    for (i = 0; i < created; i++) {
+        pthread_join(tids[i], NULL);
+        if (workers[i].err != 0) {
+            err = 1;
+        }
+    }
+
+    pthread_cond_destroy(&readyCond);
+    pthread_cond_destroy(&startCond);
+    pthread_mutex_destroy(&lock);
+    return err;
+}
+
+static int wp_ecx_shared_key_first_use(int type, const unsigned char* der,
+    size_t derLen, const unsigned char* pub, size_t pubLen,
+    const char* algName, size_t sigSize)
+{
+    int err = 0;
+    int t;
+
+    PRINT_MSG("First use of one shared private-only key from %d threads (%s)",
+        WP_ECX_SHARED_THREADS, algName);
+
+    for (t = 0; (t < WP_ECX_SHARED_TRIALS) && (err == 0); t++) {
+        EVP_PKEY* key = NULL;
+        EVP_PKEY* verifyKey = NULL;
+        EVP_PKEY* signer = NULL;
+        const unsigned char* p = der;
+        const unsigned char* sp = der;
+        unsigned char msg[] = WP_ECX_SHARED_MSG;
+        unsigned char vsig[WP_ECX_SHARED_SIG_SIZE];
+        size_t vsigLen = sizeof(vsig);
+        wp_ecx_shared_args workers[WP_ECX_SHARED_THREADS];
+        int i;
+
+        /* A new key each trial: the public half is only derived on first
+         * use, so a used key no longer exercises the derivation. */
+        key = d2i_PrivateKey_ex(type, NULL, &p, (long)derLen, wpLibCtx, NULL);
+        if (key == NULL) {
+            PRINT_ERR_MSG("Failed to load %s private-only key", algName);
+            return 1;
+        }
+
+        /* A shared wolfProvider public key for the concurrent verify wave,
+         * plus a valid signature from an independent signer so the shared key
+         * above keeps its public half underived for the first-use wave. */
+        verifyKey = EVP_PKEY_new_raw_public_key_ex(wpLibCtx, algName, NULL, pub,
+            pubLen);
+        signer = d2i_PrivateKey_ex(type, NULL, &sp, (long)derLen, osslLibCtx,
+            NULL);
+        if ((verifyKey == NULL) || (signer == NULL) ||
+                (test_digest_sign(signer, osslLibCtx, msg, sizeof(msg) - 1,
+                    NULL, NULL, vsig, &vsigLen, 0, 0) != 0)) {
+            PRINT_ERR_MSG("Failed to prepare %s verify workload", algName);
+            EVP_PKEY_free(signer);
+            EVP_PKEY_free(verifyKey);
+            EVP_PKEY_free(key);
+            return 1;
+        }
+        EVP_PKEY_free(signer);
+
+        /* Wave 1: every worker first-uses the one shared private-only key, so
+         * the lazy public-key derivation runs under full contention. */
+        memset(workers, 0, sizeof(workers));
+        for (i = 0; i < WP_ECX_SHARED_THREADS; i++) {
+            workers[i].key = key;
+            workers[i].pub = pub;
+            workers[i].pubLen = pubLen;
+            workers[i].sigLen = sigSize;
+            workers[i].algName = algName;
+            workers[i].mode = (i & 1) ? WP_ECX_MODE_EXPORT : WP_ECX_MODE_SIGN;
+        }
+        if (wp_ecx_run_workers(workers, WP_ECX_SHARED_THREADS) != 0) {
+            PRINT_ERR_MSG("%s first-use wave failed", algName);
+            err = 1;
+        }
+
+        /* Wave 2: every worker verifies the same signature through the one
+         * shared wolfProvider public key, so the verify lock runs under
+         * contention. */
+        if (err == 0) {
+            memset(workers, 0, sizeof(workers));
+            for (i = 0; i < WP_ECX_SHARED_THREADS; i++) {
+                workers[i].verifyKey = verifyKey;
+                workers[i].vsig = vsig;
+                workers[i].vsigLen = vsigLen;
+                workers[i].algName = algName;
+                workers[i].mode = WP_ECX_MODE_VERIFY;
+            }
+            if (wp_ecx_run_workers(workers, WP_ECX_SHARED_THREADS) != 0) {
+                PRINT_ERR_MSG("%s concurrent verify wave failed", algName);
+                err = 1;
+            }
+        }
+
+        EVP_PKEY_free(verifyKey);
+        EVP_PKEY_free(key);
+    }
+
+    return err;
+}
+#endif /* WP_HAVE_ECX_SHARED_KEY_TEST */
+
+/*
+ * Use one private-only EdDSA key from more than one thread at the same time.
+ *
+ * A seed-only PKCS#8 key has no public half until wolfProvider derives it.
+ * The derivation writes into the shared key object, so it must hold the key
+ * mutex. Without it, a thread signs or exports with a partly written public
+ * key.
+ */
+int test_ecx_shared_key_first_use(void *data)
+{
+    (void)data;
+
+#ifndef WP_HAVE_ECX_SHARED_KEY_TEST
+    PRINT_MSG("Skipping shared key first use test (no pthreads)");
+    return 0;
+#else
+    int err = 0;
+
+#ifdef WP_HAVE_ED25519
+    if (wp_ecx_shared_key_first_use(EVP_PKEY_ED25519, ed25519_key_der,
+            sizeof(ed25519_key_der), ed25519_pub_key_raw,
+            sizeof(ed25519_pub_key_raw), "ED25519",
+            ED25519_SIG_SIZE) != 0) {
+        err = 1;
+    }
+#endif
+#ifdef WP_HAVE_ED448
+    if (wp_ecx_shared_key_first_use(EVP_PKEY_ED448, ed448_key_der,
+            sizeof(ed448_key_der), ed448_pub_key_raw,
+            sizeof(ed448_pub_key_raw), "ED448", ED448_SIG_SIZE) != 0) {
+        err = 1;
+    }
+#endif
+    return err;
+#endif /* WP_HAVE_ECX_SHARED_KEY_TEST */
 }
 
 #endif /* defined(WP_HAVE_ED25519) || defined(WP_HAVE_ED448) */

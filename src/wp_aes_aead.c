@@ -239,7 +239,6 @@ static int wp_aead_tls_init(wp_AeadCtx* ctx, unsigned char* aad, size_t aadLen)
         /* Cache AAD. */
         XMEMCPY(buf, aad, aadLen);
         ctx->tlsAadLen = aadLen;
-        ctx->tlsEncRecords = 0;
 
         len = (buf[aadLen - 2] << 8) | buf[aadLen - 1];
         if (len >= EVP_AEAD_TLS_EXPLICIT_IV_LEN) {
@@ -319,8 +318,8 @@ static int wp_aead_cache_aad(wp_AeadCtx *ctx, const unsigned char *in,
  * Cache more input data in AEAD context object.
  *
  * @param [in, out] ctx    AEAD context object.
- * @param [in]      in     More AAD data.
- * @param [in]      inLen  Length of new AAD data.
+ * @param [in]      in     More input data.
+ * @param [in]      inLen  Length of new input data.
  * @return  1 on success.
  * @return  0 on failure.
  */
@@ -885,12 +884,69 @@ static const OSSL_PARAM *wp_aead_settable_ctx_params(wp_AeadCtx* ctx,
     return wp_aead_supported_settable_ctx_params;
 }
 
+#if defined(WP_HAVE_AESGCM) || defined(WP_HAVE_AESCCM)
+/**
+ * Discard any per-operation state cached on the context.
+ *
+ * Called on (re)initialization with a fresh IV so an abandoned operation
+ * cannot leak its cached AAD or input into the next operation.
+ *
+ * @param [in, out] ctx  AEAD context object.
+ */
+static void wp_aead_reset_op_state(wp_AeadCtx* ctx)
+{
+    if (ctx->aad != NULL) {
+        OPENSSL_free(ctx->aad);
+        ctx->aad = NULL;
+    }
+    ctx->aadLen = 0;
+    ctx->aadSet = 0;
+#if defined(WP_HAVE_AESGCM) && !defined(WOLFSSL_AESGCM_STREAM)
+    if (ctx->in != NULL) {
+        OPENSSL_clear_free(ctx->in, ctx->inLen);
+        ctx->in = NULL;
+    }
+    ctx->inLen = 0;
+    ctx->bufSize = 0;
+#endif
+}
+#endif
+
 
 #ifdef WP_HAVE_AESGCM
 
 /*
  * AES-GCM
  */
+
+/**
+ * Increment the 64-bit invocation field at the end of the IV/nonce.
+ *
+ * @param [in, out] ctx  AEAD context object.
+ */
+static int wp_aesgcm_iv_inc(wp_AeadCtx* ctx)
+{
+    int ok = 1;
+    int i;
+    unsigned char* p;
+
+    /* Invocation field is the trailing 8 bytes; fail on a too-short IV. */
+    if (ctx->ivLen < EVP_GCM_TLS_EXPLICIT_IV_LEN) {
+        ok = 0;
+    }
+    else {
+        p = ctx->iv + ctx->ivLen - EVP_GCM_TLS_EXPLICIT_IV_LEN;
+
+        /* Big-endian increment of the invocation field, carrying on wrap. */
+        for (i = EVP_GCM_TLS_EXPLICIT_IV_LEN - 1; i >= 0; i--) {
+            if ((++p[i]) != 0) {
+                break;
+            }
+        }
+    }
+
+    return ok;
+}
 
 /**
  * Get the random part of the IV/nonce.
@@ -912,8 +968,10 @@ static int wp_aesgcm_get_rand_iv(wp_AeadCtx* ctx, unsigned char* out,
 
     WOLFPROV_ENTER(WP_LOG_COMP_AES, "wp_aesgcm_get_rand_iv");
 
-    /* Ensure that an IV/nonce has not been generated or a key set. */
-    if ((!ctx->ivGen) || (!ctx->keySet)) {
+    /* Ensure that an IV/nonce has been generated and a key set. When the
+     * nonce will be advanced, the invocation field must exist first. */
+    if ((!ctx->ivGen) || (!ctx->keySet) ||
+        (inc && (ctx->ivLen < EVP_GCM_TLS_EXPLICIT_IV_LEN))) {
         ok = 0;
     }
     if (ok) {
@@ -936,15 +994,12 @@ static int wp_aesgcm_get_rand_iv(wp_AeadCtx* ctx, unsigned char* out,
 #ifndef WOLFSSL_AESGCM_STREAM
         XMEMCPY(ctx->origIv, ctx->iv, ctx->ivLen);
 #endif
-        if (inc) {
-            int i;
-            unsigned char* p = ctx->iv + ctx->ivLen - 8;
-
-            for (i = 7; i >= 0 && (++p[i]) == 0; i--) {
-                /* Nothing to do. */
-            }
+        if (inc && (!wp_aesgcm_iv_inc(ctx))) {
+            ok = 0;
         }
-        ctx->ivState = IV_STATE_COPIED;
+        if (ok) {
+            ctx->ivState = IV_STATE_COPIED;
+        }
     }
 
     WOLFPROV_LEAVE(WP_LOG_COMP_AES, __FILE__ ":" WOLFPROV_STRINGIZE(__LINE__), ok);
@@ -971,6 +1026,9 @@ static int wp_aesgcm_set_rand_iv(wp_AeadCtx *ctx, unsigned char *in,
      * is the decrypt side.
      */
     if ((!ctx->ivGen) || (!ctx->keySet) || (ctx->enc)) {
+        ok = 0;
+    }
+    else if (ctx->ivLen < inLen) {
         ok = 0;
     }
     else {
@@ -1017,10 +1075,16 @@ static int wp_aesgcm_tls_iv_set_fixed(wp_AeadCtx* ctx, unsigned char* iv,
         }
         if (ctx->enc) {
             int rc;
+        #ifndef WP_SINGLE_THREADED
+            int locked = 0;
+        #endif
 
         #ifndef WP_SINGLE_THREADED
             if (!wp_provctx_lock_rng(ctx->provCtx)) {
                 ok = 0;
+            }
+            else {
+                locked = 1;
             }
         #endif
             if (ok) {
@@ -1032,7 +1096,9 @@ static int wp_aesgcm_tls_iv_set_fixed(wp_AeadCtx* ctx, unsigned char* iv,
                 }
             }
         #ifndef WP_SINGLE_THREADED
-            wp_provctx_unlock_rng(ctx->provCtx);
+            if (locked) {
+                wp_provctx_unlock_rng(ctx->provCtx);
+            }
         #endif
             if (ok && len > 0) {
                 XMEMCPY(ctx->iv, ctx->aes.reg, ctx->ivLen);
@@ -1132,6 +1198,21 @@ static int wp_aesgcm_einit(wp_AeadCtx* ctx, const unsigned char *key,
         ctx->enc = 1;
         ctx->keySet |= (key != NULL);
         ctx->tlsAadLen = UNINITIALISED_SIZET;
+        /* A fresh IV starts a new operation and clears per-operation state.
+         * Without one, a context that already produced output is made terminal
+         * so its IV/nonce cannot be reused. */
+        if (iv != NULL) {
+            ctx->authErr = 0;
+            ctx->tagAvail = 0;
+            wp_aead_reset_op_state(ctx);
+        }
+        else if (ctx->ivState == IV_STATE_COPIED) {
+            ctx->ivState = IV_STATE_FINISHED;
+            wp_aead_reset_op_state(ctx);
+        }
+        if (key != NULL) {
+            ctx->tlsEncRecords = 0;
+        }
         ok = wp_aead_set_ctx_params(ctx, params);
     }
 
@@ -1204,6 +1285,21 @@ static int wp_aesgcm_dinit(wp_AeadCtx *ctx, const unsigned char *key,
         ctx->enc = 0;
         ctx->keySet |= (key != NULL);
         ctx->tlsAadLen = UNINITIALISED_SIZET;
+        /* A fresh IV starts a new operation and clears per-operation state.
+         * Without one, a context that already produced output is made terminal
+         * so its IV/nonce cannot be reused. */
+        if (iv != NULL) {
+            ctx->authErr = 0;
+            ctx->tagAvail = 0;
+            wp_aead_reset_op_state(ctx);
+        }
+        else if (ctx->ivState == IV_STATE_COPIED) {
+            ctx->ivState = IV_STATE_FINISHED;
+            wp_aead_reset_op_state(ctx);
+        }
+        if (key != NULL) {
+            ctx->tlsEncRecords = 0;
+        }
         ok = wp_aead_set_ctx_params(ctx, params);
     }
 
@@ -1243,6 +1339,11 @@ static int wp_aesgcm_tls_cipher(wp_AeadCtx* ctx, unsigned char* out,
         ok = 0;
     }
 
+    /* Reject a nonce too short to advance before encrypting the record. */
+    if (ok && ctx->enc && (ctx->ivLen < EVP_GCM_TLS_EXPLICIT_IV_LEN)) {
+        ok = 0;
+    }
+
     if (ok) {
         if (ctx->enc) {
             if (!wp_aesgcm_get_rand_iv(ctx, out, EVP_GCM_TLS_EXPLICIT_IV_LEN,
@@ -1270,6 +1371,9 @@ static int wp_aesgcm_tls_cipher(wp_AeadCtx* ctx, unsigned char* out,
                     ctx->buf, EVP_AEAD_TLS1_AAD_LEN);
             if (rc != 0) {
                 WOLFPROV_MSG_DEBUG_RETCODE(WP_LOG_LEVEL_DEBUG, "wc_AesGcmEncrypt", rc);
+                ok = 0;
+            }
+            if (!wp_aesgcm_iv_inc(ctx)) {
                 ok = 0;
             }
         }
@@ -1327,7 +1431,19 @@ static int wp_aesgcm_stream_update(wp_AeadCtx *ctx, unsigned char *out,
         done = 1;
     }
 
+    /* A completed operation must not be reused without a fresh IV; the nonce
+     * would otherwise repeat. An init that supplies an IV clears this state. */
+    if ((!done) && ok && (ctx->ivState == IV_STATE_FINISHED)) {
+        ok = 0;
+    }
+
     if ((!done) && (outSize < inLen)) {
+        ok = 0;
+    }
+
+    /* Reject encryption and decryption when no IV has been supplied by the
+     * caller. */
+    if (!done && ok && (ctx->ivState == IV_STATE_UNINITIALISED)) {
         ok = 0;
     }
 
@@ -1413,6 +1529,13 @@ static int wp_aesgcm_stream_final(wp_AeadCtx *ctx, unsigned char *out,
         ok = 0;
     }
 
+    /*
+     * Reject encryption and decryption when no IV has been supplied.
+     */
+    if ((!done) && ok && (ctx->ivState == IV_STATE_UNINITIALISED)) {
+        ok = 0;
+    }
+
     if ((!done) && ok) {
         if (outSize == 0) {
             outSize = (ctx->tagLen != UNINITIALISED_SIZET) ? ctx->tagLen :
@@ -1465,6 +1588,12 @@ static int wp_aesgcm_encdec(wp_AeadCtx *ctx, unsigned char *out, size_t* outLen,
 
     WOLFPROV_ENTER(WP_LOG_COMP_AES, "wp_aesgcm_encdec");
 
+    /* A completed operation must not be reused without a fresh IV; the nonce
+     * would otherwise repeat. An init that supplies an IV clears this state. */
+    if (ctx->ivState == IV_STATE_FINISHED) {
+        return 0;
+    }
+
     if ((!WP_FITS_WORD32(ctx->inLen)) || (!WP_FITS_WORD32(ctx->aadLen))) {
         return 0;
     }
@@ -1480,6 +1609,10 @@ static int wp_aesgcm_encdec(wp_AeadCtx *ctx, unsigned char *out, size_t* outLen,
             if (tmp == NULL) {
                 ok = 0;
             }
+        }
+        /* Reject encryption and decryption when no IV has been supplied by the caller. */
+        if (ok && ctx->ivState == IV_STATE_UNINITIALISED) {
+            ok = 0;
         }
         /* Once loaded, always use original IV */
         iv = ctx->iv;
@@ -1552,6 +1685,11 @@ static int wp_aesgcm_encdec(wp_AeadCtx *ctx, unsigned char *out, size_t* outLen,
         OPENSSL_clear_free(tmp, ctx->inLen);
     }
     else {
+        /* A decrypt that reaches finalisation without running the
+         * authenticated decrypt must never report success. */
+        if (done && (!ctx->enc)) {
+            ok = 0;
+        }
         *outLen = 0;
     }
     if (done) {
@@ -1596,7 +1734,12 @@ static int wp_aesgcm_stream_update(wp_AeadCtx *ctx, unsigned char *out,
     else {
         int oLen = 0;
 
-        if ((out == NULL) && (in == NULL)) {
+        /* A completed operation must not accept more input without a fresh IV;
+         * reject before caching so rejected data is not retained. */
+        if (ctx->ivState == IV_STATE_FINISHED) {
+            ok = 0;
+        }
+        else if ((out == NULL) && (in == NULL)) {
             /* Nothing to do. */
             oLen = (word32)inLen;
         }
@@ -1660,6 +1803,7 @@ static int wp_aesgcm_stream_final(wp_AeadCtx *ctx, unsigned char *out,
     else {
         ok = wp_aesgcm_encdec(ctx, out, outLen, ctx->inLen, 1);
         ctx->ivSet = 0;
+        ctx->ivState = IV_STATE_FINISHED;
     }
 
     WOLFPROV_LEAVE(WP_LOG_COMP_AES, __FILE__ ":" WOLFPROV_STRINGIZE(__LINE__), ok);
@@ -1845,6 +1989,18 @@ static int wp_aesccm_init(wp_AeadCtx* ctx, const unsigned char *key,
     if (ok) {
         ctx->enc = enc;
         ctx->tlsAadLen = UNINITIALISED_SIZET;
+        /* A fresh IV starts a new operation and clears per-operation state.
+         * Without one, a context that already produced output is made terminal
+         * so its IV/nonce cannot be reused. */
+        if (iv != NULL) {
+            ctx->authErr = 0;
+            ctx->tagAvail = 0;
+            wp_aead_reset_op_state(ctx);
+        }
+        else if (ctx->ivState == IV_STATE_COPIED) {
+            ctx->ivState = IV_STATE_FINISHED;
+            wp_aead_reset_op_state(ctx);
+        }
         ok = wp_aead_set_ctx_params(ctx, params);
     }
 
@@ -1997,11 +2153,25 @@ static int wp_aesccm_encdec(wp_AeadCtx *ctx, unsigned char *out,
         return 0;
     }
 
+    /* A completed operation must not be reused without a fresh IV; the nonce
+     * would otherwise repeat. A fresh IV clears this state. */
+    if (ctx->ivState == IV_STATE_FINISHED) {
+        return 0;
+    }
+
     if (ctx->tagLen == UNINITIALISED_SIZET) {
         ctx->tagLen = EVP_CCM_TLS_TAG_LEN;
     }
 
-    if (ctx->enc) {
+    /*
+     * Reject encryption and decryption when no IV/nonce has been supplied by
+     * the caller.
+     */
+    if (ctx->ivState == IV_STATE_UNINITIALISED) {
+        ok = 0;
+    }
+
+    if (ok && ctx->enc) {
         if (!ctx->ivSet) {
             rc = wc_AesCcmSetNonce(&ctx->aes, ctx->iv, (word32)ctx->ivLen);
             if (rc != 0) {
@@ -2021,7 +2191,7 @@ static int wp_aesccm_encdec(wp_AeadCtx *ctx, unsigned char *out,
             }
         }
     }
-    else {
+    else if (ok) {
         rc = wc_AesCcmDecrypt(&ctx->aes, out, in, (word32)inLen,
             ctx->iv, (word32)ctx->ivLen, ctx->buf, (word32)ctx->tagLen,
             ctx->aad, (word32)ctx->aadLen);
@@ -2134,6 +2304,7 @@ static int wp_aesccm_stream_final(wp_AeadCtx *ctx, unsigned char *out,
         }
         if (ok) {
             ctx->ivSet = 0;
+            ctx->ivState = IV_STATE_FINISHED;
             *outLen = 0;
         }
     }
@@ -2158,7 +2329,7 @@ static int wp_aesccm_cipher(wp_AeadCtx *ctx, unsigned char *out,
     size_t *outLen, size_t outSize, const unsigned char *in, size_t inLen)
 {
     int ok = 1;
-    size_t finalLen;
+    size_t finalLen = 0;
 
     WOLFPROV_ENTER(WP_LOG_COMP_AES, "wp_aesccm_cipher");
 
@@ -2166,11 +2337,23 @@ static int wp_aesccm_cipher(wp_AeadCtx *ctx, unsigned char *out,
         ok = 0;
     }
     if (ok) {
-        ok = wp_aesccm_stream_update(ctx, out, outLen, outSize, in, inLen);
-    }
-    if (ok) {
-        ok = wp_aesccm_stream_final(ctx, out + *outLen, &finalLen,
-            outSize - *outLen);
+        *outLen = 0;
+        /* One-shot CCM: the total-length declaration and the trailing finalise
+         * both arrive as a NULL/NULL pass. ivSet (set by the payload encrypt,
+         * and unlike tagAvail not cleared by GET_TAG) separates them: clear is
+         * the length declaration and must not finalise, or the payload that
+         * follows is rejected; set falls through to finalise so
+         * IV_STATE_FINISHED is set against nonce reuse. */
+        if ((in == NULL) && (out == NULL) && (!ctx->ivSet)) {
+            *outLen = inLen;
+        }
+        else if (in != NULL) {
+            ok = wp_aesccm_stream_update(ctx, out, outLen, outSize, in, inLen);
+        }
+        else {
+            ok = wp_aesccm_stream_final(ctx, out + *outLen, &finalLen,
+                outSize - *outLen);
+        }
     }
     if (ok) {
         *outLen += finalLen;

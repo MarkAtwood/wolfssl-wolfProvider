@@ -1,0 +1,199 @@
+name: Nightly FIPS Ready Bundle Tests
+
+# Sweeps EVERY hosted FIPS Ready bundle at or above the floor. PR-time
+# fips-ready.yml runs the narrower fips_ready_pr_array (the back-compat
+# anchors plus the newest) to keep PR turnaround short; this restores the
+# versions it drops. Both sets are resolved at run time by
+# _discover-versions.yml, so a new FIPS Ready release joins the sweep on its
+# own.
+
+on:
+  workflow_call: {}
+  workflow_dispatch: {}
+
+# No concurrency group: github.workflow is the caller's here, so any group collides with sibling calls.
+
+jobs:
+  test_fetch_script:
+    name: Test fetch-fips-ready.sh
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout wolfProvider
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Run network-free resolver tests
+        run: ./scripts/test-fetch-fips-ready.sh
+
+  # Mirror every hosted FIPS Ready bundle into ghcr so the test jobs (and
+  # fips-ready.yml, perf-regression.yml) pull from ghcr, not wolfssl.com. This
+  # is the only job that touches wolfssl.com; a new bundle is published once and
+  # then served by ghcr digest. Skips bundles already present, so steady-state
+  # it is just existence checks. Dispatch this workflow once to seed ghcr.
+  publish_fips_ready:
+    name: Publish new FIPS Ready bundles to ghcr
+    # Any non-PR run may publish, into its own owner's ghcr namespace: upstream
+    # seeds ghcr.io/wolfssl/..., a fork seeds ghcr.io/<owner>/... so it can be
+    # tested end to end via workflow_dispatch. Fork PRs get a read-only token
+    # and are excluded here anyway.
+    if: github.event_name != 'pull_request'
+    needs: test_fetch_script
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 45
+    steps:
+      - name: Checkout wolfProvider
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install ORAS
+        run: ./scripts/install-oras.sh --dest /usr/local/bin
+      - name: Publish bundles not yet in ghcr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | oras login --username "${{ github.actor }}" \
+            --password-stdin ghcr.io
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="ghcr.io/$OWNER/wolfprovider/fips-ready"
+          HOSTED=$(./scripts/fetch-fips-ready.sh --list) || {
+            echo "::error::could not list hosted FIPS Ready bundles"
+            exit 1
+          }
+          for ver in $HOSTED; do
+            if oras manifest fetch "$REPO:$ver" >/dev/null 2>&1; then
+              echo "already in ghcr: $ver"
+              continue
+            fi
+            echo "publishing new bundle: $ver"
+            # fetch-fips-ready.sh verifies the download before it returns.
+            DIR=$(./scripts/fetch-fips-ready.sh "$ver" --dest "$GITHUB_WORKSPACE")
+            # oras-build-deps.sh push is best-effort (never fails the job), so
+            # confirm the tag actually landed rather than trusting its exit.
+            ./scripts/oras-build-deps.sh push "$REPO:$ver" "$DIR"
+            if ! oras manifest fetch "$REPO:$ver" >/dev/null 2>&1; then
+              echo "::error::publish of $ver to $REPO failed (tag absent after push)"
+              exit 1
+            fi
+            rm -rf "$DIR"
+          done
+
+  # Independent of publish_fips_ready on purpose: coupling them made a skipped
+  # publish (PR runs) propagate a skip onto require_fips_resolved, silently
+  # passing a degraded matrix. A bundle published this run is listed the next
+  # nightly instead, which is fine.
+  discover_versions:
+    needs: test_fetch_script
+    uses: ./.github/workflows/_discover-versions.yml
+    with:
+      resolve_fips: true
+
+  # See fips-ready.yml for why this can't be left to a silent floor fallback.
+  require_fips_resolved:
+    needs: discover_versions
+    name: Require FIPS Ready bundle discovery succeeded
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    steps:
+      - name: Fail if discovery fell back to the floor
+        if: needs.discover_versions.outputs.fips_ready_resolved != 'true'
+        run: |
+          echo "::error::FIPS Ready bundle discovery failed and fell back to a single floor version; refusing to report success on a silently degraded matrix. See the discover_versions job log."
+          exit 1
+
+  fips_ready_test:
+    needs: [discover_versions, require_fips_resolved]
+    name: Nightly FIPS Ready ${{ matrix.wolfssl_bundle_ref }} (${{ matrix.openssl_ref }})
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        wolfssl_bundle_ref: ${{ fromJson(needs.discover_versions.outputs.fips_ready_all_array) }}
+        openssl_ref: ${{ fromJson(needs.discover_versions.outputs.openssl_latest_ref_array) }}
+    steps:
+      - name: Checkout wolfProvider
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache build dependencies
+        id: deps
+        uses: ./.github/actions/oras-build-deps
+        with:
+          variant: fips-ready
+          openssl_ref: ${{ matrix.openssl_ref }}
+          wolfssl_fixed_key: wolfssl-fips-${{ matrix.wolfssl_bundle_ref }}-${{ matrix.openssl_ref }}
+          # The build below sets WOLFPROV_FIPS_FORCE_FAIL, which adds
+          # -DHAVE_FORCE_FIPS_FAILURE to the wolfSSL build; key the cached
+          # install on it so a wolfSSL built without the define is never reused.
+          extra_key: forcefail
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download FIPS Ready Bundle
+        uses: ./.github/actions/fetch-fips-bundle
+        with:
+          version: ${{ matrix.wolfssl_bundle_ref }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build wolfProvider with FIPS Ready Bundle
+        run: |
+          # WOLFPROV_FIPS_FORCE_FAIL is an internal, test-only knob (no CLI
+          # flag) that enables HAVE_FORCE_FIPS_FAILURE for the fips_status test.
+          OPENSSL_TAG=${{ matrix.openssl_ref }} \
+          WOLFPROV_FIPS_FORCE_FAIL=1 \
+          ./scripts/build-wolfprovider.sh --fips-bundle="$FIPS_BUNDLE_PATH" \
+          --fips-check=ready --wolfssl-ver=v${{matrix.wolfssl_bundle_ref}}-stable
+
+      - name: Report resolved FIPS module version
+        run: |
+          # Authoritative source: the FIPS version wolfSSL's own build resolved
+          # `ready` to, read from HAVE_FIPS_VERSION_MAJOR rather than guessed
+          # from the bundle version. A missing file or macro means the FIPS
+          # build did not install as expected, so fail rather than report
+          # "unknown".
+          OPTS="wolfssl-install/include/wolfssl/options.h"
+          if [ ! -f "$OPTS" ]; then
+            echo "::error::wolfSSL options.h not found at $OPTS; FIPS build did not install as expected"
+            exit 1
+          fi
+          MAJ=$(grep -oE '#define +HAVE_FIPS_VERSION_MAJOR +[0-9]+' "$OPTS" | awk '{print $3}')
+          if [ -z "$MAJ" ]; then
+            echo "::error::HAVE_FIPS_VERSION_MAJOR not found in $OPTS"
+            exit 1
+          fi
+          echo "Bundle ${{ matrix.wolfssl_bundle_ref }} builds FIPS module v$MAJ"
+          echo "FIPS module v$MAJ from bundle ${{ matrix.wolfssl_bundle_ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push build dependencies
+        uses: ./.github/actions/oras-build-deps-push
+        with:
+          registry: ${{ steps.deps.outputs.registry }}
+          openssl_install_tag: ${{ steps.deps.outputs.openssl_install_tag }}
+          wolfssl_install_tag: ${{ steps.deps.outputs.wolfssl_install_tag }}
+          openssl_hit: ${{ steps.deps.outputs.openssl_hit }}
+          wolfssl_hit: ${{ steps.deps.outputs.wolfssl_hit }}
+
+      - name: Run FIPS Command Tests
+        run: |
+          export WOLFSSL_ISFIPS=1
+          source scripts/env-setup
+
+          # --- normal mode ---
+          ./scripts/cmd_test/do-cmd-tests.sh
+
+          # --- force-fail mode ---
+          WOLFPROV_FORCE_FAIL=1 ./scripts/cmd_test/do-cmd-tests.sh
+
+      - name: Run FIPS Status Test
+        run: |
+          export WOLFSSL_ISFIPS=1
+          source scripts/env-setup
+          ./test/standalone/tests/fips_status/run.sh

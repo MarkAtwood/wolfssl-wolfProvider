@@ -80,7 +80,7 @@ static CTX* name##_newctx(WOLFPROV_CTX* provCtx)                               \
 static void name##_freectx(CTX* ctx)                                           \
 {                                                                              \
     free(ctx);                                                                 \
-    OPENSSL_free(ctx);                                                         \
+    OPENSSL_clear_free(ctx, sizeof(*ctx));                                     \
 }
 
 /** Implement duplicating a digest object. */
@@ -96,13 +96,13 @@ static CTX* name##_dupctx(CTX* src)                                            \
 {                                                                              \
     CTX* dst = NULL;                                                           \
     if (wolfssl_prov_is_running()) {                                           \
-        dst = OPENSSL_malloc(sizeof(*src));                                    \
+        dst = OPENSSL_zalloc(sizeof(*dst));                                    \
     }                                                                          \
     if (dst != NULL) {                                                         \
         int rc;                                                                \
         rc = copy(src, dst);                                                   \
         if (rc != 0) {                                                         \
-            OPENSSL_free(dst);                                                 \
+            OPENSSL_clear_free(dst, sizeof(*dst));                             \
             dst = NULL;                                                        \
         }                                                                      \
     }                                                                          \
@@ -528,25 +528,21 @@ IMPLEMENT_DIGEST(wp_sha512, wc_Sha512,
                  wc_InitSha512_ex, wc_Sha512Update, wc_Sha512Final,
                  wc_Sha512Copy, wc_Sha512Free)
 
-#if LIBWOLFSSL_VERSION_HEX >= 0x05000000
-#if !defined(WOLFSSL_NOSHA512_224) && \
-    !defined(HAVE_FIPS) && !defined(HAVE_SELFTEST)
+#ifdef WP_HAVE_SHA512_224
 IMPLEMENT_DIGEST(wp_sha512_224, wc_Sha512_224,
                  WC_SHA512_224_BLOCK_SIZE, WC_SHA512_224_DIGEST_SIZE,
                  WP_SHA2_FLAGS,
                  wc_InitSha512_224_ex, wc_Sha512_224Update, wc_Sha512_224Final,
                  wc_Sha512_224Copy, wc_Sha512_224Free)
-#endif /* WOLFSSL_NOSHA512_224 */
+#endif /* WP_HAVE_SHA512_224 */
 
-#if !defined(WOLFSSL_NOSHA512_256) && \
-    !defined(HAVE_FIPS) && !defined(HAVE_SELFTEST)
+#ifdef WP_HAVE_SHA512_256
 IMPLEMENT_DIGEST(wp_sha512_256, wc_Sha512_256,
                  WC_SHA512_256_BLOCK_SIZE, WC_SHA512_256_DIGEST_SIZE,
                  WP_SHA2_FLAGS,
                  wc_InitSha512_256_ex, wc_Sha512_256Update, wc_Sha512_256Final,
                  wc_Sha512_256Copy, wc_Sha512_256Free)
-#endif /* WOLFSSL_NOSHA512_256 */
-#endif
+#endif /* WP_HAVE_SHA512_256 */
 #endif /* WP_HAVE_SHA512 */
 
 
@@ -670,7 +666,7 @@ static int name##_final(CTX* ctx, unsigned char* out, size_t* outLen,          \
 static void name##_freectx(CTX* ctx)                                           \
 {                                                                              \
     free(&ctx->obj);                                                           \
-    OPENSSL_free(ctx);                                                         \
+    OPENSSL_clear_free(ctx, sizeof(*ctx));                                     \
 }
 
 /** Implement duplicating an XOF object. */
@@ -686,14 +682,14 @@ static CTX* name##_dupctx(CTX* src)                                            \
 {                                                                              \
     CTX* dst = NULL;                                                           \
     if (wolfssl_prov_is_running()) {                                           \
-        dst = OPENSSL_malloc(sizeof(*src));                                    \
+        dst = OPENSSL_zalloc(sizeof(*dst));                                    \
     }                                                                          \
     if (dst != NULL) {                                                         \
         int rc;                                                                \
         rc = copy(&src->obj, &dst->obj);                                       \
         if (rc != 0) {                                                         \
             WOLFPROV_MSG_DEBUG_RETCODE(WP_LOG_LEVEL_DEBUG, #copy, rc);  \
-            OPENSSL_free(dst);                                                 \
+            OPENSSL_clear_free(dst, sizeof(*dst));                             \
             dst = NULL;                                                        \
         }                                                                      \
         else {                                                                 \
@@ -807,4 +803,3 @@ IMPLEMENT_XOF(shake, wp_shake_256, wc_Shake, wp_ShakeCtx,
               wc_Shake256_Copy, wc_Shake256_Free)
 
 #endif
-

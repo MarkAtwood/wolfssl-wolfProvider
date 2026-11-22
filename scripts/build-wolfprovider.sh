@@ -17,7 +17,8 @@ show_help() {
   echo "  --wolfssl-ver=VER          Which version of wolfSSL to clone"
   echo "  --enable-fips              Build wolfProvider with a cloned FIPS bundle. Use with --fips-check to specify tag (default: v5.2.4)"
   echo "  --fips-bundle=DIR          Build wolfProvider with a directory containing a wolfSSL FIPS bundle. Use with --fips-check to specify tag"
-  echo "  --fips-check=TAG           Choose a FIPS tag (v5.2.1, v5.2.4, linuxv5.2.1, v6.0.0, ready, etc). Automatically determines configure option"
+  echo "  --fips-check=TAG           Choose a FIPS tag (v5.2.1, v5.2.4, linuxv5.2.1, v6.0.0, v7.0.0, ready, etc). Automatically determines configure option"
+  echo "                             'ready' follows the bundle: FIPS v7 up to bundle 5.9.1, v8 from 5.9.2 on. Fetch bundles with scripts/fetch-fips-ready.sh"
   echo "  --debian                   Build a Debian package"
   echo "  --debian --enable-fips     Build a Debian package with FIPS support"
   echo "  --quicktest                Disable some tests for a faster testing suite"
@@ -32,9 +33,11 @@ show_help() {
   echo "  --debug-silent             Debug logging compiled in but silent by default. Use WOLFPROV_LOG_LEVEL and WOLFPROV_LOG_COMPONENTS env vars to enable at runtime. Requires --debug."
   echo "  --enable-seed-src          Enable SEED-SRC entropy source with /dev/urandom caching for fork-safe entropy."
   echo "                             Note: This also enables WC_RNG_SEED_CB in wolfSSL."
-  echo "  --enable-pqc               Enable both ML-KEM and ML-DSA (requires wolfSSL master/v5.9.2+ and OpenSSL 3.6+)."
+  echo "  --enable-pqc               Enable ML-KEM, ML-DSA and SLH-DSA (requires wolfSSL master/v5.9.2+ and OpenSSL 3.6+)."
   echo "  --enable-mlkem             Enable ML-KEM only."
   echo "  --enable-mldsa             Enable ML-DSA only."
+  echo "  --enable-slhdsa            Enable SLH-DSA only, with all 12 parameter sets."
+  echo "  --enable-lms               Enable LMS verification only (requires OpenSSL 3.6+)."
   echo "  --enable-openssl-test      Build OpenSSL with its test suite (e.g. evp_test). For CI that runs OpenSSL's own tests."
   echo ""
   echo "Environment Variables:"
@@ -55,9 +58,12 @@ show_help() {
   echo "  WOLFPROV_FIPS_BASELINE     If set to 1, applies FIPS baseline patch to OpenSSL (mutually exclusive with WOLFPROV_REPLACE_DEFAULT)"
   echo "  WOLFPROV_LEAVE_SILENT      If set to 1, suppress logging of return 0 in functions where return 0 is expected behavior sometimes."
   echo "  WOLFPROV_SEED_SRC          If set to 1, enables SEED-SRC with /dev/urandom caching (also enables WC_RNG_SEED_CB in wolfSSL)"
-  echo "  WOLFPROV_PQC               If set to 1, enables both ML-KEM and ML-DSA (requires wolfSSL master/v5.9.2+ and OpenSSL 3.6+)"
+  echo "  WOLFPROV_PQC               If set to 1, enables ML-KEM, ML-DSA and SLH-DSA (requires wolfSSL master/v5.9.2+ and OpenSSL 3.6+)"
   echo "  WOLFPROV_MLKEM             If set to 1, enables ML-KEM only"
   echo "  WOLFPROV_MLDSA             If set to 1, enables ML-DSA only"
+  echo "  WOLFPROV_SLHDSA            If set to 1, enables SLH-DSA only, with all 12 parameter sets"
+  echo "  WOLFSSL_SLHDSA_CONFIG      wolfSSL SLH-DSA profile (default: yes,sha2; use yes,sha2,verify-only for verification only)"
+  echo "  WOLFPROV_LMS               If set to 1, enables LMS verification only"
   echo ""
 }
 
@@ -156,12 +162,19 @@ for arg in "$@"; do
         --enable-pqc)
             WOLFPROV_MLKEM=1
             WOLFPROV_MLDSA=1
+            WOLFPROV_SLHDSA=1
             ;;
         --enable-mlkem)
             WOLFPROV_MLKEM=1
             ;;
         --enable-mldsa)
             WOLFPROV_MLDSA=1
+            ;;
+        --enable-slhdsa)
+            WOLFPROV_SLHDSA=1
+            ;;
+        --enable-lms)
+            WOLFPROV_LMS=1
             ;;
         --enable-openssl-test)
             WOLFPROV_OPENSSL_TEST=1
@@ -216,9 +229,18 @@ fi
 if [ "$WOLFPROV_PQC" = "1" ]; then
     WOLFPROV_MLKEM=1
     WOLFPROV_MLDSA=1
+    WOLFPROV_SLHDSA=1
 fi
-if [ "$WOLFPROV_MLKEM" = "1" ] || [ "$WOLFPROV_MLDSA" = "1" ]; then
+if [ "$WOLFPROV_MLKEM" = "1" ] || [ "$WOLFPROV_MLDSA" = "1" ] || \
+   [ "$WOLFPROV_SLHDSA" = "1" ]; then
     WOLFPROV_PQC=1
+fi
+
+if { [ "$WOLFSSL_ISFIPS" = "1" ] || [ -n "$WOLFSSL_FIPS_BUNDLE" ]; } &&
+        { [ "$WOLFPROV_PQC" = "1" ] || [ "$WOLFPROV_LMS" = "1" ]; }; then
+    echo "ERROR: PQC is not supported by the selected validated FIPS module."
+    echo "       Enable it only after the module-specific CAST integration is available."
+    exit 1
 fi
 
 # The Debian package path builds against the distribution OpenSSL (bookworm
@@ -227,8 +249,8 @@ fi
 # broken build. Once Debian ships OpenSSL 3.6+, PQC support here is a small
 # addition: forward the per-algorithm flags through install-wolfprov.sh and
 # debian/rules (mirroring the --debug/--fips flags).
-if [ -n "$build_debian" ] && [ "$WOLFPROV_PQC" = "1" ]; then
-    echo "ERROR: PQC (--enable-pqc/--enable-mlkem/--enable-mldsa) is not supported with --debian; the distro OpenSSL is older than the required 3.6+."
+if [ -n "$build_debian" ] && { [ "$WOLFPROV_PQC" = "1" ] || [ "$WOLFPROV_LMS" = "1" ]; }; then
+    echo "ERROR: PQC (--enable-pqc/--enable-mlkem/--enable-mldsa/--enable-slhdsa/--enable-lms) is not supported with --debian; the distro OpenSSL is older than the required 3.6+."
     exit 1
 fi
 
@@ -300,7 +322,7 @@ fi
 # PQC needs newer wolfSSL/OpenSSL than the repo defaults, so when PQC is
 # requested and the user has not pinned a version, default to PQC-capable ones
 # (the version gate below still enforces the floors for explicit pins).
-if [ "$WOLFPROV_PQC" = "1" ]; then
+if [ "$WOLFPROV_PQC" = "1" ] || [ "$WOLFPROV_LMS" = "1" ]; then
     if [ -z "$WOLFSSL_TAG" ]; then
         WOLFSSL_TAG=master
         echo "PQC: defaulting WOLFSSL_TAG=master"
@@ -317,22 +339,22 @@ source ${SCRIPT_DIR}/utils-wolfprovider.sh
 
 echo "Using openssl: $OPENSSL_TAG, wolfssl: $WOLFSSL_TAG"
 
-# ML-KEM / ML-DSA need the wolfSSL FIPS 203/204 seed and message APIs that land
-# after v5.9.1-stable, and the matching OpenSSL provider params that arrive in
-# 3.6. Refuse PQC on older releases so the failure is an explicit message, not
-# an opaque missing-symbol build error. master and non -stable wolfSSL refs
+# ML-KEM / ML-DSA / LMS need wolfSSL APIs and the matching OpenSSL provider
+# interfaces that are available with wolfSSL v5.9.2+ (or master) and OpenSSL
+# 3.6+. Refuse PQC on older releases so the failure is an explicit message,
+# not an opaque missing-symbol build error. Non-stable wolfSSL refs
 # (branches/commits) are assumed new enough.
 # 'sort -V' is GNU-only; on a host without it skip the gate (a compile-time
 # guard in settings.h still rejects too-old versions) rather than misfiring.
-if [ "$WOLFPROV_PQC" = "1" ] && ! printf '1\n2\n' | sort -V >/dev/null 2>&1; then
+if { [ "$WOLFPROV_PQC" = "1" ] || [ "$WOLFPROV_LMS" = "1" ]; } && ! printf '1\n2\n' | sort -V >/dev/null 2>&1; then
     echo "WARNING: 'sort -V' unavailable; skipping PQC version check (compile-time guard still applies)."
-elif [ "$WOLFPROV_PQC" = "1" ]; then
+elif [ "$WOLFPROV_PQC" = "1" ] || [ "$WOLFPROV_LMS" = "1" ]; then
     PQC_MIN_WOLFSSL="v5.9.2-stable"
     case "$WOLFSSL_TAG" in
         v*-stable)
             if [ "$(printf '%s\n%s\n' "$PQC_MIN_WOLFSSL" "$WOLFSSL_TAG" \
                     | sort -V | head -n1)" != "$PQC_MIN_WOLFSSL" ]; then
-                echo "ERROR: ML-KEM/ML-DSA require wolfSSL master or ${PQC_MIN_WOLFSSL} or higher (got ${WOLFSSL_TAG})."
+                echo "ERROR: PQC algorithms require wolfSSL master or ${PQC_MIN_WOLFSSL} or higher (got ${WOLFSSL_TAG})."
                 exit 1
             fi
             ;;
@@ -342,7 +364,7 @@ elif [ "$WOLFPROV_PQC" = "1" ]; then
         openssl-3.*)
             if [ "$(printf '%s\n%s\n' "$PQC_MIN_OPENSSL" "$OPENSSL_TAG" \
                     | sort -V | head -n1)" != "$PQC_MIN_OPENSSL" ]; then
-                echo "ERROR: ML-KEM/ML-DSA require ${PQC_MIN_OPENSSL} or higher (got ${OPENSSL_TAG})."
+                echo "ERROR: PQC algorithms require ${PQC_MIN_OPENSSL} or higher (got ${OPENSSL_TAG})."
                 exit 1
             fi
             ;;

@@ -197,6 +197,12 @@ TEST_CASE test_case[] = {
 #ifdef WP_HAVE_SHA512
     TEST_DECL(test_sha512, NULL),
 #endif
+#ifdef WP_HAVE_SHA512_224
+    TEST_DECL(test_sha512_224, NULL),
+#endif
+#ifdef WP_HAVE_SHA512_256
+    TEST_DECL(test_sha512_256, NULL),
+#endif
 #ifdef WP_HAVE_SHA3_224
     TEST_DECL(test_sha3_224, NULL),
 #endif
@@ -212,13 +218,19 @@ TEST_CASE test_case[] = {
 #ifdef WP_HAVE_SHAKE_256
     TEST_DECL(test_shake_256, NULL),
 #endif
+#ifdef WP_HAVE_DIGEST
+    TEST_DECL(test_digest_dupctx, NULL),
+#endif
     TEST_DECL(test_digest_multi_update, NULL),
 #ifdef WP_HAVE_HMAC
     TEST_DECL(test_hmac_create, NULL),
     TEST_DECL(test_hmac_key_no_digest, NULL),
     TEST_DECL(test_hmac_multi_update, NULL),
+    TEST_DECL(test_hmac_reinit, NULL),
     TEST_DECL(test_hmac_dup, NULL),
     TEST_DECL(test_hmac_size_query, NULL),
+    TEST_DECL(test_hmac_tls_data_size, NULL),
+    TEST_DECL(test_hmac_tls_dummy_blocks, NULL),
     TEST_DECL(test_mac_key_match, NULL),
     TEST_DECL(test_mac_sig_dup, NULL),
 #endif
@@ -227,10 +239,12 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_cmac_multi_update, &flags),
     TEST_DECL(test_cmac_dup, &flags),
     TEST_DECL(test_cmac_size_query, &flags),
+    TEST_DECL(test_cmac_large_buffer, &flags),
 #endif
 #ifdef WP_HAVE_GMAC
     TEST_DECL(test_gmac_create, &flags),
     TEST_DECL(test_gmac_dup, &flags),
+    TEST_DECL(test_gmac_large_buffer, &flags),
 #endif
 #ifdef WP_HAVE_TLS1_PRF
     TEST_DECL(test_tls1_prf, NULL),
@@ -252,6 +266,7 @@ TEST_CASE test_case[] = {
 #ifdef WP_HAVE_DES3CBC
     #if !defined(HAVE_FIPS) || defined(WP_ALLOW_NON_FIPS)
         TEST_DECL(test_des3_cbc, NULL),
+        TEST_DECL(test_des3_cbc_reinit, NULL),
         TEST_DECL(test_des3_cbc_stream, NULL),
         TEST_DECL(test_des3_cbc_bad_pad, NULL),
         TEST_DECL(test_des3_cbc_large_update, NULL),
@@ -287,11 +302,15 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_aes128_cfb_stream, NULL),
     TEST_DECL(test_aes192_cfb_stream, NULL),
     TEST_DECL(test_aes256_cfb_stream, NULL),
+    TEST_DECL(test_aes128_cfb_reinit, NULL),
     TEST_DECL(test_aes_cfb_large_update, NULL),
 #endif
 #ifdef WP_HAVE_AESCTS
     TEST_DECL(test_aes128_cts, NULL),
     TEST_DECL(test_aes256_cts, NULL),
+    TEST_DECL(test_aes128_cts_one_block, NULL),
+    TEST_DECL(test_aes128_cts_split_init, NULL),
+    TEST_DECL(test_aes128_cts_one_block_split_init, NULL),
 #endif
     TEST_DECL(test_cipher_null_zero, NULL),
 #ifdef WP_HAVE_AESGCM
@@ -300,11 +319,21 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_aes256_gcm, NULL),
     TEST_DECL(test_aes128_gcm_fixed, NULL),
     TEST_DECL(test_aes128_gcm_tls, NULL),
+    TEST_DECL(test_aes_gcm_tls_multi_record, NULL),
     TEST_DECL(test_aes128_gcm_set_iv_inv, NULL),
     TEST_DECL(test_aes128_gcm_key_then_iv, NULL),
     TEST_DECL(test_aes_gcm_bad_tag, NULL),
+    TEST_DECL(test_aes_gcm_decrypt_ctx_reuse, NULL),
+    TEST_DECL(test_aes_gcm_iv_gen_short, NULL),
+    TEST_DECL(test_aes_gcm_set_iv_inv_short, NULL),
+    TEST_DECL(test_aes_gcm_reuse_tag_bypass, NULL),
+    TEST_DECL(test_aes_gcm_encrypt_reuse_no_iv, NULL),
+    TEST_DECL(test_aes_gcm_encrypt_partial_reuse_no_iv, NULL),
     TEST_DECL(test_aes_gcm_tls_iv_fixed_oversized, NULL),
     TEST_DECL(test_aes_gcm_tag_len_undersized, NULL),
+    TEST_DECL(test_aes_gcm_key_no_iv, NULL),
+    TEST_DECL(test_aes_gcm_stream_key_no_iv, NULL),
+    TEST_DECL(test_aes_gcm_final_no_update_no_iv, NULL),
 #endif
 #ifdef WP_HAVE_AESCCM
     TEST_DECL(test_aes128_ccm, NULL),
@@ -313,7 +342,10 @@ TEST_CASE test_case[] = {
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
     TEST_DECL(test_aes128_ccm_tls, NULL),
     TEST_DECL(test_aes_ccm_bad_tag, NULL),
+    TEST_DECL(test_aes_ccm_ctx_reuse, NULL),
+    TEST_DECL(test_aes_ccm_oneshot_encrypt, NULL),
     TEST_DECL(test_aes_ccm_tag_len_undersized, NULL),
+    TEST_DECL(test_aes_ccm_key_no_iv, NULL),
 #endif
 #endif
 #ifdef WP_HAVE_RANDOM
@@ -328,7 +360,8 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_dh_pgen_pkey, NULL),
     TEST_DECL(test_dh_pkey, NULL),
     TEST_DECL(test_dh_invalid_kdf_strings, NULL),
-#if defined(WOLFSSL_DH_EXTRA) && defined(WP_HAVE_EPKI_TEST)
+#if defined(WOLFSSL_DH_EXTRA) && defined(WP_HAVE_EPKI_TEST) && \
+    !defined(HAVE_FIPS)
     TEST_DECL(test_dh_encode_epki, NULL),
 #endif
     TEST_DECL(test_dh_decode, NULL),
@@ -361,6 +394,12 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_rsa_get_params, NULL),
 #endif
     TEST_DECL(test_rsa_sig_alg_id, NULL),
+#ifdef WP_HAVE_SHA512_224
+    TEST_DECL(test_rsa_sha512_224_dupctx, NULL),
+#endif
+#ifdef WP_HAVE_SHA512_256
+    TEST_DECL(test_rsa_sha512_256_dupctx, NULL),
+#endif
     TEST_DECL(test_rsa_pss_salt, NULL),
     TEST_DECL(test_rsa_pss_restrictions, NULL),
     TEST_DECL(test_rsa_load_key, NULL),
@@ -411,11 +450,13 @@ TEST_CASE test_case[] = {
     #endif
 #endif
 #ifdef WP_HAVE_EC_P256
+    TEST_DECL(test_ecc_encode_short_write_bio, NULL),
     #ifdef WP_HAVE_EPKI_TEST
         TEST_DECL(test_ecc_encode_epki, NULL),
     #endif
     #ifdef WP_HAVE_ECKEYGEN
         TEST_DECL(test_eckeygen_p256, NULL),
+        TEST_DECL(test_ecc_p256_get_params_stale_ret, NULL),
     #endif
     #ifdef WP_HAVE_ECDH
     #ifdef WP_HAVE_ECKEYGEN
@@ -527,9 +568,12 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_ecx_null_init, NULL),
 #ifdef WP_HAVE_X25519
     TEST_DECL(test_ecx_x25519_raw_priv_roundtrip, NULL),
+    TEST_DECL(test_ecx_x25519_get_params_stale_ret, NULL),
     TEST_DECL(test_ecx_import_zero_priv, NULL),
+    TEST_DECL(test_ecx_import_short_pub, NULL),
 #endif
     TEST_DECL(test_ecx_dup, NULL),
+    TEST_DECL(test_ecx_shared_key_first_use, NULL),
 #endif
 #if defined(WP_HAVE_X25519) || defined(WP_HAVE_X448)
     TEST_DECL(test_ecx_x_security_bits, NULL),
@@ -552,10 +596,19 @@ TEST_CASE test_case[] = {
     #endif
 #endif
 
+#ifdef WP_HAVE_LMS
+    TEST_DECL(test_lms_verify, NULL),
+    TEST_DECL(test_lms_import_export, NULL),
+    TEST_DECL(test_lms_decode, NULL),
+    TEST_DECL(test_lms_provider_ab, NULL),
+    TEST_DECL(test_lms_unsupported_operations, NULL),
+#endif
+
 #ifdef WP_HAVE_MLKEM
     TEST_DECL(test_mlkem_keygen, NULL),
     TEST_DECL(test_mlkem_import_export_roundtrip, NULL),
     TEST_DECL(test_mlkem_encap_decap, NULL),
+    TEST_DECL(test_mlkem_mixed_null, NULL),
     TEST_DECL(test_mlkem_decap_tampered_ct, NULL),
     TEST_DECL(test_mlkem_decap_wrong_key, NULL),
     TEST_DECL(test_mlkem_dup, NULL),
@@ -588,6 +641,41 @@ TEST_CASE test_case[] = {
     TEST_DECL(test_mldsa_reinit_null_key, NULL),
     TEST_DECL(test_mldsa_encode_decode, NULL),
     TEST_DECL(test_mldsa_x509_sign_verify, NULL),
+#endif
+
+#if defined(WP_HAVE_SLHDSA) && defined(WP_SLHDSA_TEST_SETS)
+    TEST_DECL(test_slhdsa_public_keymgmt, NULL),
+    #ifdef WP_HAVE_SLHDSA_PRIVATE
+    #ifdef WP_HAVE_EPKI_TEST
+    TEST_DECL(test_slhdsa_encode_epki, NULL),
+    #endif
+    TEST_DECL(test_slhdsa_keygen, NULL),
+    TEST_DECL(test_slhdsa_all_set_metadata, NULL),
+    TEST_DECL(test_slhdsa_provider_ab, NULL),
+    TEST_DECL(test_slhdsa_validate_keypair, NULL),
+    TEST_DECL(test_slhdsa_import_export_roundtrip, NULL),
+    TEST_DECL(test_slhdsa_sign_verify, NULL),
+    TEST_DECL(test_slhdsa_verify_tampered_sig, NULL),
+    TEST_DECL(test_slhdsa_verify_tampered_msg, NULL),
+    TEST_DECL(test_slhdsa_verify_wrong_key, NULL),
+    TEST_DECL(test_slhdsa_dup, NULL),
+    TEST_DECL(test_slhdsa_match, NULL),
+    TEST_DECL(test_slhdsa_dupctx, NULL),
+    TEST_DECL(test_slhdsa_oneshot_sign_verify, NULL),
+    TEST_DECL(test_slhdsa_message_api, NULL),
+    TEST_DECL(test_slhdsa_reject_digest, NULL),
+    TEST_DECL(test_slhdsa_get_params, NULL),
+    TEST_DECL(test_slhdsa_pubonly_sign_fails, NULL),
+    TEST_DECL(test_slhdsa_import_mismatched_pubpriv, NULL),
+    TEST_DECL(test_slhdsa_empty_message, NULL),
+    TEST_DECL(test_slhdsa_reinit_null_key, NULL),
+    TEST_DECL(test_slhdsa_encode_decode, NULL),
+    TEST_DECL(test_slhdsa_sig_params, NULL),
+    TEST_DECL(test_slhdsa_undersized_sig, NULL),
+    TEST_DECL(test_slhdsa_midstream_params, NULL),
+    TEST_DECL(test_slhdsa_keygen_seed, NULL),
+    TEST_DECL(test_slhdsa_x509_sign_verify, NULL),
+    #endif
 #endif
 };
 #define TEST_CASE_CNT   (int)(sizeof(test_case) / sizeof(*test_case))
@@ -962,13 +1050,24 @@ int main(int argc, char* argv[])
     if (err == 0 && runTests) {
         printf("\n");
 
-        (void)staticTest;
-        printf("Running tests using dynamic provider.\n");
         OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
 
         wpLibCtx = OSSL_LIB_CTX_new();
 
+        (void)staticTest;
+#ifdef WP_UNIT_STATIC_PROVIDER
+        /* Linked into this executable, so there is no module to load. Loading
+         * it here would put a second copy of wolfProvider in the process. */
+        printf("Running tests using built-in (statically linked) provider.\n");
+        if (!OSSL_PROVIDER_add_builtin(wpLibCtx, name,
+                wolfssl_provider_init)) {
+            PRINT_ERR_MSG("Failed to add built-in wolf provider!\n");
+            err = 1;
+        }
+#else
+        printf("Running tests using dynamic provider.\n");
         OSSL_PROVIDER_set_default_search_path(wpLibCtx, dir);
+#endif
         wpProv = OSSL_PROVIDER_load(wpLibCtx, name);
         if (wpProv == NULL) {
             PRINT_ERR_MSG("Failed to find wolf provider!\n");

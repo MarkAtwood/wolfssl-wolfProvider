@@ -30,7 +30,9 @@
 #ifdef WOLFPROV_USER_SETTINGS
 #include <user_settings.h>
 #endif
+#ifndef WOLFSSL_USER_SETTINGS
 #include <wolfssl/options.h>
+#endif
 #include <wolfssl/wolfcrypt/wc_port.h>
 
 #include <openssl/provider.h>
@@ -50,12 +52,30 @@
     #define AES_BLOCK_SIZE 16
 #endif
 
-/* Encrypted PKCS#8 (EncryptedPrivateKeyInfo) round-trip tests require
- * encrypted-key, PKCS#8 and PBKDF support in the linked wolfSSL. */
-#if defined(WOLFSSL_ENCRYPTED_KEYS) && defined(HAVE_PKCS8) && \
-    !defined(NO_PWDBASED)
+/* Match the capability the encoders gate on. Keying this off
+ * WOLFSSL_ENCRYPTED_KEYS compiled the tests out of FIPS builds, where the
+ * encrypted-key code is still live. */
+#ifdef WP_HAVE_PKCS8_ENC
     #define WP_HAVE_EPKI_TEST
 #endif
+
+/* test_slhdsa.c selects a representative set and falls back to any enabled
+ * set when a custom wolfSSL build enables only one parameter set. */
+#if defined(WP_HAVE_SLH_DSA_SHA2_128F) || \
+    defined(WP_HAVE_SLH_DSA_SHA2_128S) || \
+    defined(WP_HAVE_SLH_DSA_SHA2_192F) || \
+    defined(WP_HAVE_SLH_DSA_SHA2_192S) || \
+    defined(WP_HAVE_SLH_DSA_SHA2_256F) || \
+    defined(WP_HAVE_SLH_DSA_SHA2_256S) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_128F) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_128S) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_192F) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_192S) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_256F) || \
+    defined(WP_HAVE_SLH_DSA_SHAKE_256S)
+    #define WP_SLHDSA_TEST_SETS
+#endif
+
 
 #ifdef TEST_MULTITHREADED
 #define PRINT_MSG(str)
@@ -137,6 +157,8 @@ int test_sha224(void *data);
 int test_sha256(void *data);
 int test_sha384(void *data);
 int test_sha512(void *data);
+int test_sha512_224(void *data);
+int test_sha512_256(void *data);
 int test_sha3_224(void *data);
 int test_sha3_256(void *data);
 int test_sha3_384(void *data);
@@ -144,6 +166,7 @@ int test_sha3_512(void *data);
 #ifdef WP_HAVE_SHAKE_256
 int test_shake_256(void *data);
 #endif
+int test_digest_dupctx(void *data);
 
 #endif /* WP_HAVE_DIGEST */
 
@@ -153,8 +176,11 @@ int test_digest_multi_update(void *data);
 int test_hmac_create(void *data);
 int test_hmac_key_no_digest(void *data);
 int test_hmac_multi_update(void *data);
+int test_hmac_reinit(void *data);
 int test_hmac_dup(void *data);
 int test_hmac_size_query(void *data);
+int test_hmac_tls_data_size(void *data);
+int test_hmac_tls_dummy_blocks(void *data);
 int test_mac_key_match(void *data);
 int test_mac_sig_dup(void *data);
 #endif /* WP_HAVE_HMAC */
@@ -164,11 +190,13 @@ int test_cmac_create(void *data);
 int test_cmac_multi_update(void *data);
 int test_cmac_dup(void *data);
 int test_cmac_size_query(void *data);
+int test_cmac_large_buffer(void *data);
 #endif /* WP_HAVE_CMAC */
 
 #ifdef WP_HAVE_GMAC
 int test_gmac_create(void *data);
 int test_gmac_dup(void *data);
+int test_gmac_large_buffer(void *data);
 #endif /* WP_HAVE_GMAC */
 
 #ifdef WP_HAVE_TLS1_PRF
@@ -193,6 +221,7 @@ int test_sshkdf(void *data);
 
 #ifdef WP_HAVE_DES3CBC
 int test_des3_cbc(void *data);
+int test_des3_cbc_reinit(void *data);
 int test_des3_cbc_stream(void *data);
 int test_des3_cbc_bad_pad(void *data);
 int test_des3_cbc_large_update(void *data);
@@ -238,6 +267,7 @@ int test_aes_ctr_large_update(void *data);
 int test_aes128_cfb_stream(void *data);
 int test_aes192_cfb_stream(void *data);
 int test_aes256_cfb_stream(void *data);
+int test_aes128_cfb_reinit(void *data);
 int test_aes_cfb_large_update(void *data);
 
 #endif
@@ -251,11 +281,21 @@ int test_aes192_gcm(void *data);
 int test_aes256_gcm(void *data);
 int test_aes128_gcm_fixed(void *data);
 int test_aes128_gcm_tls(void *data);
+int test_aes_gcm_tls_multi_record(void *data);
 int test_aes128_gcm_set_iv_inv(void *data);
 int test_aes128_gcm_key_then_iv(void *data);
 int test_aes_gcm_bad_tag(void *data);
+int test_aes_gcm_decrypt_ctx_reuse(void *data);
+int test_aes_gcm_iv_gen_short(void *data);
+int test_aes_gcm_set_iv_inv_short(void *data);
+int test_aes_gcm_reuse_tag_bypass(void *data);
+int test_aes_gcm_encrypt_reuse_no_iv(void *data);
+int test_aes_gcm_encrypt_partial_reuse_no_iv(void *data);
 int test_aes_gcm_tls_iv_fixed_oversized(void *data);
 int test_aes_gcm_tag_len_undersized(void *data);
+int test_aes_gcm_key_no_iv(void *data);
+int test_aes_gcm_stream_key_no_iv(void *data);
+int test_aes_gcm_final_no_update_no_iv(void *data);
 
 #endif /* WP_HAVE_AESGCM */
 
@@ -266,7 +306,10 @@ int test_aes192_ccm(void *data);
 int test_aes256_ccm(void *data);
 int test_aes128_ccm_tls(void *data);
 int test_aes_ccm_bad_tag(void *data);
+int test_aes_ccm_ctx_reuse(void *data);
+int test_aes_ccm_oneshot_encrypt(void *data);
 int test_aes_ccm_tag_len_undersized(void *data);
+int test_aes_ccm_key_no_iv(void *data);
 
 #endif /* WP_HAVE_AESCCM */
 
@@ -274,6 +317,9 @@ int test_aes_ccm_tag_len_undersized(void *data);
 
 int test_aes128_cts(void *data);
 int test_aes256_cts(void *data);
+int test_aes128_cts_one_block(void *data);
+int test_aes128_cts_split_init(void *data);
+int test_aes128_cts_one_block_split_init(void *data);
 
 #endif
 
@@ -316,6 +362,12 @@ int test_pkey_dec(EVP_PKEY *pkey, OSSL_LIB_CTX* libCtx, unsigned char *msg,
     size_t msgLen, unsigned char *ciphertext, size_t cipherLen, int padMode,
     const EVP_MD *rsaMd, const EVP_MD *rsaMgf1Md);
 
+/* Key-format helpers, used by every algorithm's tests. */
+int test_pki_cipher_encrypts(EVP_PKEY* pkey, const char* fmt,
+    const char* encProp, OSSL_LIB_CTX* decLibCtx, int cmpKey);
+int test_epki_encode_decode(EVP_PKEY* pkey, const char* fmt,
+                  const char* encProp, OSSL_LIB_CTX* decLibCtx);
+
 #ifdef WP_HAVE_RSA
 int test_pkey_enc_rsa(EVP_PKEY *pkey, unsigned char *msg, size_t msgLen,
                   unsigned char *ciphertext, size_t cipherLen, int padMode,
@@ -323,8 +375,6 @@ int test_pkey_enc_rsa(EVP_PKEY *pkey, unsigned char *msg, size_t msgLen,
 int test_pkey_dec_rsa(EVP_PKEY *pkey, unsigned char *msg, size_t msgLen,
                   unsigned char *ciphertext, size_t cipherLen, int padMode,
                   const EVP_MD *rsaMd, const EVP_MD *rsaMgf1Md);
-int test_epki_encode_decode(EVP_PKEY* pkey, const char* fmt,
-                  const char* encProp, OSSL_LIB_CTX* decLibCtx);
 int test_rsa_sign_sha1(void *data);
 int test_rsa_sign_verify_pkcs1(void *data);
 int test_rsa_sign_verify_recover_pkcs1(void *data);
@@ -337,6 +387,8 @@ int test_rsa_pkey_keygen(void *data);
 int test_rsa_pkey_invalid_key_size(void *data);
 int test_rsa_get_params(void *data);
 int test_rsa_sig_alg_id(void *data);
+int test_rsa_sha512_224_dupctx(void *data);
+int test_rsa_sha512_256_dupctx(void *data);
 int test_rsa_pss_salt(void *date);
 int test_rsa_pss_restrictions(void *data);
 
@@ -362,7 +414,8 @@ int test_rsa_key_integrity(void* data);
 int test_dh_pgen_pkey(void *data);
 int test_dh_pkey(void *data);
 int test_dh_invalid_kdf_strings(void *data);
-#if defined(WOLFSSL_DH_EXTRA) && defined(WP_HAVE_EPKI_TEST)
+#if defined(WOLFSSL_DH_EXTRA) && defined(WP_HAVE_EPKI_TEST) && \
+    !defined(HAVE_FIPS)
 int test_dh_encode_epki(void *data);
 #endif
 int test_dh_decode(void *data);
@@ -395,6 +448,7 @@ int test_eckeygen_p224(void *data);
 
 #ifdef WP_HAVE_EC_P256
 int test_eckeygen_p256(void *data);
+int test_ecc_p256_get_params_stale_ret(void *data);
 #endif /* WP_HAVE_EC_P256 */
 
 #ifdef WP_HAVE_EC_P384
@@ -414,6 +468,10 @@ int test_eckeygen_x448(void *data);
 #endif /* WP_HAVE_X448 */
 
 #endif /* WP_HAVE_ECKEYGEN */
+
+#ifdef WP_HAVE_EC_P256
+int test_ecc_encode_short_write_bio(void *data);
+#endif /* WP_HAVE_EC_P256 */
 
 #ifdef WP_HAVE_ECDH
 
@@ -543,9 +601,12 @@ int test_ecx_misc(void *data);
 int test_ecx_null_init(void *data);
 #ifdef WP_HAVE_X25519
 int test_ecx_x25519_raw_priv_roundtrip(void *data);
+int test_ecx_x25519_get_params_stale_ret(void *data);
 int test_ecx_import_zero_priv(void *data);
+int test_ecx_import_short_pub(void *data);
 #endif /* WP_HAVE_X25519 */
 int test_ecx_dup(void *data);
+int test_ecx_shared_key_first_use(void *data);
 #endif
 
 #if defined(WP_HAVE_X25519) || defined(WP_HAVE_X448)
@@ -570,10 +631,19 @@ int test_des3_tls_cbc_dec(void *data);
 #endif
 #endif
 
+#ifdef WP_HAVE_LMS
+int test_lms_import_export(void *data);
+int test_lms_verify(void *data);
+int test_lms_decode(void *data);
+int test_lms_provider_ab(void *data);
+int test_lms_unsupported_operations(void *data);
+#endif
+
 #ifdef WP_HAVE_MLKEM
 int test_mlkem_keygen(void *data);
 int test_mlkem_import_export_roundtrip(void *data);
 int test_mlkem_encap_decap(void *data);
+int test_mlkem_mixed_null(void *data);
 int test_mlkem_decap_tampered_ct(void *data);
 int test_mlkem_decap_wrong_key(void *data);
 int test_mlkem_dup(void *data);
@@ -606,6 +676,41 @@ int test_mldsa_empty_message(void *data);
 int test_mldsa_reinit_null_key(void *data);
 int test_mldsa_encode_decode(void *data);
 int test_mldsa_x509_sign_verify(void *data);
+#endif
+
+#if defined(WP_HAVE_SLHDSA) && defined(WP_SLHDSA_TEST_SETS)
+int test_slhdsa_public_keymgmt(void *data);
+#ifdef WP_HAVE_SLHDSA_PRIVATE
+#ifdef WP_HAVE_EPKI_TEST
+int test_slhdsa_encode_epki(void *data);
+#endif
+int test_slhdsa_keygen(void *data);
+int test_slhdsa_all_set_metadata(void *data);
+int test_slhdsa_provider_ab(void *data);
+int test_slhdsa_validate_keypair(void *data);
+int test_slhdsa_import_export_roundtrip(void *data);
+int test_slhdsa_sign_verify(void *data);
+int test_slhdsa_verify_tampered_sig(void *data);
+int test_slhdsa_verify_tampered_msg(void *data);
+int test_slhdsa_verify_wrong_key(void *data);
+int test_slhdsa_dup(void *data);
+int test_slhdsa_match(void *data);
+int test_slhdsa_dupctx(void *data);
+int test_slhdsa_oneshot_sign_verify(void *data);
+int test_slhdsa_message_api(void *data);
+int test_slhdsa_reject_digest(void *data);
+int test_slhdsa_get_params(void *data);
+int test_slhdsa_pubonly_sign_fails(void *data);
+int test_slhdsa_import_mismatched_pubpriv(void *data);
+int test_slhdsa_empty_message(void *data);
+int test_slhdsa_reinit_null_key(void *data);
+int test_slhdsa_encode_decode(void *data);
+int test_slhdsa_sig_params(void *data);
+int test_slhdsa_undersized_sig(void *data);
+int test_slhdsa_midstream_params(void *data);
+int test_slhdsa_keygen_seed(void *data);
+int test_slhdsa_x509_sign_verify(void *data);
+#endif
 #endif
 
 #endif /* UNIT_H */

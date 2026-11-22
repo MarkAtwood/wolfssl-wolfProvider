@@ -1,0 +1,206 @@
+name: libacvp PQC Tests
+
+on:
+  workflow_call:
+    inputs:
+      wolfssl_refs_json:
+        description: "JSON array of wolfssl refs to test; empty = master + latest -stable (pre-PQC-floor refs are dropped)"
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  discover-versions:
+    name: Resolve wolfSSL/OpenSSL versions
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      openssl-tag: ${{ steps.set-matrix.outputs.openssl-tag }}
+    steps:
+      - name: Resolve wolfSSL refs and latest OpenSSL release
+        id: set-matrix
+        env:
+          INPUT_REFS: ${{ inputs.wolfssl_refs_json }}
+        run: |
+          set -euo pipefail
+          LATEST=$(git ls-remote --tags --refs \
+              https://github.com/wolfSSL/wolfssl.git 'v*-stable' \
+              | awk -F/ '{print $NF}' | sort -V | tail -n 1)
+          if [ -z "${LATEST:-}" ]; then
+            echo "::error::Could not resolve latest wolfSSL -stable tag"
+            exit 1
+          fi
+          # PQC needs OpenSSL 3.6+, so always build against the latest release.
+          OSSL=$(git ls-remote --tags --refs \
+              https://github.com/openssl/openssl.git 'openssl-3.*' \
+              | awk -F/ '{print $NF}' | grep -E '^openssl-3\.[0-9.]+$' \
+              | sort -V | tail -n 1)
+          if [ -z "${OSSL:-}" ]; then
+            echo "::error::Could not resolve latest OpenSSL release tag"
+            exit 1
+          fi
+          echo "Latest stable wolfSSL: $LATEST"
+          echo "Latest OpenSSL: $OSSL"
+          echo "openssl-tag=$OSSL" >> "$GITHUB_OUTPUT"
+          # Caller can override the ref set (e.g. nightly Wave 2); default is
+          # master + latest -stable.
+          if [ -n "${INPUT_REFS:-}" ]; then
+            REFS=$(printf '%s' "$INPUT_REFS" | jq -r '.[]')
+          else
+            REFS=$(printf '%s\n%s\n' "master" "$LATEST")
+          fi
+          # PQC needs the wc_MlDsaKey_* seed/message API in v5.9.2-stable.
+          # master is always eligible; a stable ref must be at the floor or
+          # newer. A
+          # pre-floor ref (e.g. v5.8.4-stable from Wave 2) is dropped, since it
+          # would fail the --enable-pqc gate.
+          PQC_FLOOR="v5.9.2-stable"
+          ELIGIBLE=()
+          for ref in $REFS; do
+            if [ "$ref" = "master" ]; then
+              ELIGIBLE+=("$ref")
+            elif [ "$(printf '%s\n%s\n' "$PQC_FLOOR" "$ref" \
+                     | sort -V | tail -n1)" = "$ref" ]; then
+              ELIGIBLE+=("$ref")
+            else
+              echo "::notice::Skipping pre-PQC-floor wolfSSL ref $ref (floor $PQC_FLOOR)"
+            fi
+          done
+          if [ ${#ELIGIBLE[@]} -eq 0 ]; then
+            REFS_JSON='[]'
+          else
+            REFS_JSON=$(printf '%s\n' "${ELIGIBLE[@]}" | jq -R . | jq -sc .)
+          fi
+          echo "Eligible wolfSSL refs: $REFS_JSON"
+          # Each eligible wolfSSL ref expands to 4 rows: replace-default and
+          # non-replace, each in normal and force-fail anti-test mode.
+          MATRIX=$(jq -nc --argjson refs "$REFS_JSON" '
+            def rows($ref; $lbl):
+              [ {"replace":true,  "ff":"WOLFPROV_FORCE_FAIL=1",
+                 "sfx":" [replace-default] [force-fail]"},
+                {"replace":true,  "ff":"","sfx":" [replace-default]"},
+                {"replace":false, "ff":"WOLFPROV_FORCE_FAIL=1",
+                 "sfx":" [non-replace] [force-fail]"},
+                {"replace":false, "ff":"","sfx":" [non-replace]"} ]
+              | map({"name":($lbl+.sfx), "wolfssl-ref":$ref,
+                     "replace":.replace, "force_fail":.ff});
+            { include: ( $refs
+                | map(rows(.; (if . == "master" then "master"
+                               else "stable (" + . + ")" end)))
+                | add // [] ) }')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  libacvp-pqc:
+    name: ${{ matrix.name }}
+    needs: discover-versions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/wolfssl/wolfprovider-test-deps:bookworm
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-versions.outputs.matrix) }}
+    steps:
+      - name: Checkout wolfProvider
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache build dependencies
+        id: deps
+        uses: ./.github/actions/oras-build-deps
+        with:
+          variant: libacvp-pqc-bookworm${{ matrix.replace && '-rd' || '' }}
+          openssl_ref: ${{ needs.discover-versions.outputs.openssl-tag }}
+          wolfssl_ref: ${{ matrix.wolfssl-ref }}
+          extra_key: --enable-pqc
+          cache_openssl_source: ${{ matrix.replace }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build wolfProvider
+        run: |
+          OPENSSL_TAG=${{ needs.discover-versions.outputs.openssl-tag }} \
+          WOLFSSL_TAG=${{ matrix.wolfssl-ref }} \
+            ./scripts/build-wolfprovider.sh --enable-pqc \
+            ${{ matrix.replace && '--replace-default' || '' }}
+
+      - name: Push build dependencies
+        uses: ./.github/actions/oras-build-deps-push
+        with:
+          registry: ${{ steps.deps.outputs.registry }}
+          openssl_install_tag: ${{ steps.deps.outputs.openssl_install_tag }}
+          wolfssl_install_tag: ${{ steps.deps.outputs.wolfssl_install_tag }}
+          openssl_source_tag: ${{ steps.deps.outputs.openssl_source_tag }}
+          openssl_hit: ${{ steps.deps.outputs.openssl_hit }}
+          wolfssl_hit: ${{ steps.deps.outputs.wolfssl_hit }}
+          openssl_source_hit: ${{ steps.deps.outputs.openssl_source_hit }}
+          cache_openssl_source: ${{ steps.deps.outputs.cache_openssl_source }}
+
+      - name: Checkout libacvp v2.3.1
+        uses: actions/checkout@v4
+        with:
+          repository: cisco/libacvp
+          ref: v2.3.1
+          path: libacvp
+          fetch-depth: 1
+
+      - name: Checkout OSP
+        uses: actions/checkout@v4
+        with:
+          repository: wolfssl/osp
+          path: osp
+          fetch-depth: 1
+
+      - name: Build libacvp test suite
+        working-directory: libacvp
+        run: |
+          PATCH=$($GITHUB_WORKSPACE/scripts/resolve-osp-patch.sh \
+            "$GITHUB_WORKSPACE/osp" libacvp v2.3.1 \
+            "${{ matrix.wolfssl-ref }}")
+          patch -p1 < "$PATCH"
+          autoreconf -fiv
+          ./configure --enable-unit-tests \
+            --with-ssl-dir="$GITHUB_WORKSPACE/openssl-install" \
+            --with-libcurl-dir=/usr
+          make -j"$(nproc)"
+
+      - name: Run full libacvp suite with PQC coverage
+        working-directory: libacvp/test
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/wolfprov-install/lib:$GITHUB_WORKSPACE/wolfssl-install/lib:$GITHUB_WORKSPACE/openssl-install/lib:$GITHUB_WORKSPACE/openssl-install/lib64"
+          export OPENSSL_MODULES="$GITHUB_WORKSPACE/wolfprov-install/lib"
+          if [ "${{ matrix.replace }}" = "true" ]; then
+            export OPENSSL_CONF="$GITHUB_WORKSPACE/openssl-install/ssl/openssl.cnf"
+          else
+            export OPENSSL_CONF="$GITHUB_WORKSPACE/provider.conf"
+          fi
+          set +e
+          if [ "${{ matrix.force_fail }}" = "WOLFPROV_FORCE_FAIL=1" ]; then
+            export WOLFPROV_FORCE_FAIL=1
+          fi
+          ./runtest -g APP_PQC_HANDLER -v 2>&1 | tee libacvp-pqc.log
+          TEST_RESULT=${PIPESTATUS[0]}
+          $GITHUB_WORKSPACE/.github/scripts/check-workflow-result.sh \
+            $TEST_RESULT "${{ matrix.force_fail }}" libacvp-pqc
+          CHECK_RESULT=$?
+          if [ $CHECK_RESULT -ne 0 ]; then
+            exit $CHECK_RESULT
+          fi
+          if [ -z "${{ matrix.force_fail }}" ]; then
+            ./runtest -v 2>&1 | tee -a libacvp-pqc.log
+            TEST_RESULT=${PIPESTATUS[0]}
+            $GITHUB_WORKSPACE/.github/scripts/check-workflow-result.sh \
+              $TEST_RESULT "" libacvp-pqc
+            CHECK_RESULT=$?
+            if [ $CHECK_RESULT -ne 0 ]; then
+              exit $CHECK_RESULT
+            fi
+          fi
